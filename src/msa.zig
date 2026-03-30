@@ -17,6 +17,7 @@ pub const Msa = struct {
     name: ?[]const u8 = null,
     accession: ?[]const u8 = null,
     description: ?[]const u8 = null,
+    weights: ?[]f64 = null,
 
     pub fn nseq(self: Msa) usize {
         return self.names.len;
@@ -168,6 +169,7 @@ pub const Msa = struct {
         if (self.name) |n| self.allocator.free(n);
         if (self.accession) |a| self.allocator.free(a);
         if (self.description) |d| self.allocator.free(d);
+        if (self.weights) |w| self.allocator.free(w);
     }
 };
 
