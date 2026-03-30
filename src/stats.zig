@@ -1,0 +1,10 @@
+/// Statistics and probability distributions used by HMMER for E-value calculations.
+pub const gumbel = @import("stats/gumbel.zig");
+pub const exponential = @import("stats/exponential.zig");
+pub const gamma = @import("stats/gamma.zig");
+
+test {
+    _ = gumbel;
+    _ = exponential;
+    _ = gamma;
+}
