@@ -235,6 +235,43 @@ pub const amino: Alphabet = .{
     .complement = null,
 };
 
+// --- Task 6: Guess alphabet type from sequence content ---
+
+/// Guess the alphabet type from sequence content.
+/// If any amino-only canonical residues (E, F, I, L, P, Q) are found, returns .amino.
+/// If >80% of recognized residues are nucleic (A,C,G,T,U,N), returns .dna.
+/// Otherwise returns .amino.
+/// Returns null if the sequence is empty or has no recognized residues.
+pub fn guessType(text: []const u8) ?AlphabetType {
+    var nuc_count: usize = 0;
+    var amino_only_count: usize = 0;
+    var total: usize = 0;
+
+    for (text) |c| {
+        const upper = if (c >= 'a' and c <= 'z') c - 32 else c;
+        switch (upper) {
+            'A', 'C', 'G', 'T', 'U', 'N' => {
+                nuc_count += 1;
+                total += 1;
+            },
+            'D', 'E', 'F', 'H', 'I', 'K', 'L', 'M', 'P', 'Q', 'R', 'S', 'V', 'W', 'Y' => {
+                switch (upper) {
+                    'E', 'F', 'I', 'L', 'P', 'Q' => amino_only_count += 1,
+                    else => {},
+                }
+                total += 1;
+            },
+            '-', '.', '_', '*', '~' => {},
+            else => {},
+        }
+    }
+
+    if (total == 0) return null;
+    if (amino_only_count > 0) return .amino;
+    if (nuc_count * 100 / total > 80) return .dna;
+    return .amino;
+}
+
 // --- Tests for Task 2 ---
 
 test "Alphabet: struct size constants for DNA" {
@@ -525,4 +562,34 @@ test "reverseComplement degeneracies RY -> RY" {
     var seq = [_]u8{ 5, 6 }; // R, Y
     try dna.reverseComplement(&seq);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 5, 6 }, &seq);
+}
+
+// --- Tests for Task 6: guessType ---
+
+test "guessType: pure DNA returns .dna" {
+    try std.testing.expectEqual(@as(?AlphabetType, .dna), guessType("ACGTACGTACGT"));
+}
+
+test "guessType: DNA with N's returns .dna" {
+    try std.testing.expectEqual(@as(?AlphabetType, .dna), guessType("ACGTNNNNACGT"));
+}
+
+test "guessType: all canonical amino acids returns .amino" {
+    try std.testing.expectEqual(@as(?AlphabetType, .amino), guessType("ACDEFGHIKLMNPQRSTVWY"));
+}
+
+test "guessType: DNA mixed with amino-only residues returns .amino" {
+    try std.testing.expectEqual(@as(?AlphabetType, .amino), guessType("ACGTEF"));
+}
+
+test "guessType: empty string returns null" {
+    try std.testing.expectEqual(@as(?AlphabetType, null), guessType(""));
+}
+
+test "guessType: lowercase DNA returns .dna" {
+    try std.testing.expectEqual(@as(?AlphabetType, .dna), guessType("acgtacgt"));
+}
+
+test "guessType: gaps only returns null" {
+    try std.testing.expectEqual(@as(?AlphabetType, null), guessType("---..."));
 }
