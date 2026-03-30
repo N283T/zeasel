@@ -17,8 +17,8 @@ pub const ScoreMatrix = struct {
     abc: *const Alphabet,
 
     /// Return score for two digital codes (canonical residues only).
-    /// No bounds checking — caller must ensure i, j < abc.k.
     pub fn score(self: ScoreMatrix, i: u8, j: u8) i8 {
+        std.debug.assert(i < 20 and j < 20);
         return self.data[i][j];
     }
 
@@ -159,4 +159,17 @@ test "identity: symmetry" {
             try std.testing.expectEqual(identity.score(i, j), identity.score(j, i));
         }
     }
+}
+
+test "blosum62: known off-diagonal values" {
+    // D-E (2,3) = 2
+    try std.testing.expectEqual(@as(i8, 2), blosum62.score(2, 3));
+    // F-Y (4,19) = 3
+    try std.testing.expectEqual(@as(i8, 3), blosum62.score(4, 19));
+    // A-R (0,14) = -1
+    try std.testing.expectEqual(@as(i8, -1), blosum62.score(0, 14));
+    // H-H (6,6) = 8
+    try std.testing.expectEqual(@as(i8, 8), blosum62.score(6, 6));
+    // P-P (12,12) = 7
+    try std.testing.expectEqual(@as(i8, 7), blosum62.score(12, 12));
 }
