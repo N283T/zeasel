@@ -4,6 +4,7 @@ pub const io = @import("io.zig");
 pub const msa = @import("msa.zig");
 pub const simd = @import("simd.zig");
 pub const stats = @import("stats.zig");
+pub const score_matrix = @import("score_matrix.zig");
 
 // Include tests from all sub-modules in `zig build test`.
 test {
@@ -13,4 +14,5 @@ test {
     _ = msa;
     _ = simd;
     _ = stats;
+    _ = score_matrix;
 }
