@@ -2,6 +2,7 @@ pub const alphabet = @import("alphabet.zig");
 pub const sequence = @import("sequence.zig");
 pub const io = @import("io.zig");
 pub const msa = @import("msa.zig");
+pub const msa_weight = @import("msa_weight.zig");
 pub const simd = @import("simd.zig");
 pub const stats = @import("stats.zig");
 pub const score_matrix = @import("score_matrix.zig");
@@ -13,6 +14,7 @@ test {
     _ = sequence;
     _ = io;
     _ = msa;
+    _ = msa_weight;
     _ = simd;
     _ = stats;
     _ = score_matrix;
