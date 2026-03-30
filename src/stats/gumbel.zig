@@ -34,9 +34,11 @@ pub fn surv(x: f64, mu: f64, lambda: f64) f64 {
 
 /// Log survival: log(1 - exp(-exp(-z)))
 /// Uses log1p for numerical stability when survival is near 1 (z is very negative).
+/// For large positive z, surv ~ exp(-z), so log_surv ~ -exp(-z) avoids log1p(-1) = -inf.
 pub fn logSurv(x: f64, mu: f64, lambda: f64) f64 {
     const z = lambda * (x - mu);
-    // log(1 - exp(-exp(-z))) = log1p(-exp(-exp(-z)))
+    // For large z, surv ~ exp(-z), so log_surv ~ -exp(-z)
+    if (z > 10.0) return -@exp(-z);
     return math.log1p(-@exp(-@exp(-z)));
 }
 
@@ -78,16 +80,26 @@ pub fn fitComplete(x: []const f64) !struct { mu: f64, lambda: f64 } {
     // => lambda = pi / (sqrt(6) * stddev)
     var lambda = math.pi / (@sqrt(6.0) * stddev);
 
+    // Find x_max to center data and prevent overflow in exp(-lambda * xi)
+    // when xi has large negative values.
+    var x_max: f64 = x[0];
+    for (x[1..]) |xi| if (xi > x_max) {
+        x_max = xi;
+    };
+
     // Newton-Raphson iteration for lambda.
     // Log-likelihood: n*log(lambda) - lambda*sum(xi) - sum(exp(-lambda*xi)) * ...
     // The score equation for lambda reduces to:
     //   1/lambda - mean(xi) + sum(xi * exp(-lambda*xi)) / sum(exp(-lambda*xi)) = 0
+    // We center by x_max: exp(-lambda*xi) = exp(-lambda*(xi-x_max)) * exp(-lambda*x_max).
+    // The exp(-lambda*x_max) factor cancels in all weighted-mean ratios, so only s0
+    // needs adjustment when deriving mu at the end.
     for (0..100) |_| {
-        var s0: f64 = 0.0; // sum of exp(-lambda * xi)
-        var s1: f64 = 0.0; // sum of xi * exp(-lambda * xi)
-        var s2: f64 = 0.0; // sum of xi^2 * exp(-lambda * xi)
+        var s0: f64 = 0.0; // sum of exp(-lambda * (xi - x_max))
+        var s1: f64 = 0.0; // sum of xi * exp(-lambda * (xi - x_max))
+        var s2: f64 = 0.0; // sum of xi^2 * exp(-lambda * (xi - x_max))
         for (x) |xi| {
-            const e = @exp(-lambda * xi);
+            const e = @exp(-lambda * (xi - x_max));
             s0 += e;
             s1 += xi * e;
             s2 += xi * xi * e;
@@ -114,10 +126,10 @@ pub fn fitComplete(x: []const f64) !struct { mu: f64, lambda: f64 } {
     }
 
     // Derive mu from the MLE relationship:
-    // mu = -(1/lambda) * log( (1/n) * sum(exp(-lambda*xi)) )
+    // mu = x_max - (1/lambda) * log( (1/n) * sum(exp(-lambda*(xi - x_max))) )
     var s0: f64 = 0.0;
-    for (x) |xi| s0 += @exp(-lambda * xi);
-    const mu = -(1.0 / lambda) * @log(s0 / n);
+    for (x) |xi| s0 += @exp(-lambda * (xi - x_max));
+    const mu = x_max - (1.0 / lambda) * @log(s0 / n);
 
     return .{ .mu = mu, .lambda = lambda };
 }
