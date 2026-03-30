@@ -21,9 +21,13 @@ pub const Writer = struct {
     }
 
     /// Write a single sequence record.
+    /// Note: for stockholm format, use stockholm.write() directly with an Msa —
+    /// writing a single ungapped Sequence in Stockholm does not make semantic sense.
+    /// This path writes the sequence in FASTA as a fallback for stockholm format.
     pub fn write(self: *Writer, seq: Sequence) !void {
         switch (self.format) {
             .fasta => try fasta.write(self.dest, seq, self.line_width),
+            .stockholm => try fasta.write(self.dest, seq, self.line_width),
         }
     }
 

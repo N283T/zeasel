@@ -5,10 +5,11 @@ const Allocator = std.mem.Allocator;
 const Alphabet = @import("../alphabet.zig").Alphabet;
 const Sequence = @import("../sequence.zig").Sequence;
 const fasta = @import("fasta.zig");
+const stockholm = @import("stockholm.zig");
 
 pub const Format = enum {
     fasta,
-    // stockholm, genbank, etc. — future phases
+    stockholm,
 
     /// Detect format from the first non-whitespace bytes of data.
     pub fn detect(header: []const u8) ?Format {
@@ -17,7 +18,9 @@ pub const Format = enum {
             i += 1;
         }
         if (i < header.len and header[i] == '>') return .fasta;
-        // future: detect Stockholm (# STOCKHOLM 1.0), GenBank (LOCUS), etc.
+        // Detect Stockholm: first non-blank line starts with "# STOCKHOLM"
+        const rest = header[i..];
+        if (std.mem.startsWith(u8, rest, "# STOCKHOLM")) return .stockholm;
         return null;
     }
 };
@@ -29,6 +32,9 @@ pub const Reader = struct {
     abc: *const Alphabet,
     allocator: Allocator,
     owns_data: bool,
+    // Stockholm buffering: sequences are extracted from the MSA on first call.
+    stk_seqs: ?[]Sequence = null,
+    stk_idx: usize = 0,
 
     /// Open a file and create a reader (reads entire file into memory).
     /// If format is null, the format is auto-detected from the file header.
@@ -70,6 +76,7 @@ pub const Reader = struct {
     pub fn next(self: *Reader) !?Sequence {
         switch (self.format) {
             .fasta => return try nextFasta(self),
+            .stockholm => return try nextStockholm(self),
         }
     }
 
@@ -106,7 +113,46 @@ pub const Reader = struct {
         return list.toOwnedSlice(self.allocator);
     }
 
+    fn nextStockholm(self: *Reader) !?Sequence {
+        // On first call, parse the entire MSA and extract all sequences.
+        if (self.stk_seqs == null) {
+            var msa = try stockholm.parse(self.allocator, self.abc, self.data);
+            errdefer msa.deinit();
+
+            const n = msa.nseq();
+            const seqs = try self.allocator.alloc(Sequence, n);
+            errdefer self.allocator.free(seqs);
+
+            var done: usize = 0;
+            errdefer for (0..done) |i| seqs[i].deinit();
+
+            for (0..n) |i| {
+                seqs[i] = try msa.extractSeq(i);
+                done += 1;
+            }
+
+            msa.deinit();
+            self.stk_seqs = seqs;
+            self.stk_idx = 0;
+            // Mark data as consumed so pos-based calls are harmless.
+            self.pos = self.data.len;
+        }
+
+        const seqs = self.stk_seqs.?;
+        if (self.stk_idx >= seqs.len) return null;
+
+        const seq = seqs[self.stk_idx];
+        self.stk_idx += 1;
+        return seq;
+    }
+
     pub fn deinit(self: *Reader) void {
+        if (self.stk_seqs) |seqs| {
+            // Sequences already returned to caller are not freed here;
+            // we only free any that were never consumed.
+            for (seqs[self.stk_idx..]) |*s| @constCast(s).deinit();
+            self.allocator.free(seqs);
+        }
         if (self.owns_data) {
             self.allocator.free(self.data);
         }
@@ -189,6 +235,14 @@ test "Format.detect: unknown returns null" {
     try std.testing.expectEqual(@as(?Format, null), Format.detect("ACGT\n"));
 }
 
+test "Format.detect: stockholm" {
+    try std.testing.expectEqual(@as(?Format, .stockholm), Format.detect("# STOCKHOLM 1.0\n"));
+}
+
+test "Format.detect: stockholm with leading newline" {
+    try std.testing.expectEqual(@as(?Format, .stockholm), Format.detect("\n# STOCKHOLM 1.0\n"));
+}
+
 test "Format.detect: fasta with leading whitespace" {
     try std.testing.expectEqual(@as(?Format, .fasta), Format.detect("\n>seq1\nACGT\n"));
 }
@@ -249,6 +303,30 @@ test "Reader.readAll" {
     try std.testing.expectEqual(@as(usize, 2), seqs.len);
     try std.testing.expectEqualStrings("seq1", seqs[0].name);
     try std.testing.expectEqualStrings("seq2", seqs[1].name);
+}
+
+test "Reader.next: stockholm yields ungapped sequences" {
+    const allocator = std.testing.allocator;
+    const data = "# STOCKHOLM 1.0\n\nseq1  AC-GT\nseq2  ACGGT\n//\n";
+
+    var reader = try Reader.fromMemory(allocator, &alphabet_mod.dna, data, null);
+    defer reader.deinit();
+
+    try std.testing.expectEqual(Format.stockholm, reader.format);
+
+    var seq1 = (try reader.next()) orelse return error.ExpectedSequence;
+    defer seq1.deinit();
+    try std.testing.expectEqualStrings("seq1", seq1.name);
+    // Gaps removed: AC-GT -> ACGT (4 residues)
+    try std.testing.expectEqual(@as(usize, 4), seq1.dsq.len);
+
+    var seq2 = (try reader.next()) orelse return error.ExpectedSequence;
+    defer seq2.deinit();
+    try std.testing.expectEqualStrings("seq2", seq2.name);
+    try std.testing.expectEqual(@as(usize, 5), seq2.dsq.len);
+
+    const eof = try reader.next();
+    try std.testing.expectEqual(@as(?Sequence, null), eof);
 }
 
 test "Reader.readAll: second call on exhausted reader returns empty" {
