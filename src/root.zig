@@ -21,6 +21,7 @@ pub const varint = @import("varint.zig");
 pub const graph = @import("graph.zig");
 pub const cpu = @import("cpu.zig");
 pub const ratematrix = @import("ratematrix.zig");
+pub const threads = @import("threads.zig");
 
 // Include tests from all sub-modules in `zig build test`.
 test {
@@ -47,4 +48,5 @@ test {
     _ = graph;
     _ = cpu;
     _ = ratematrix;
+    _ = threads;
 }
