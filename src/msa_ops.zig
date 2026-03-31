@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Alphabet = @import("alphabet.zig").Alphabet;
 const Msa = @import("msa.zig").Msa;
 const Random = @import("util/random.zig").Random;
 const pairwiseIdentity = @import("msa_weight.zig").pairwiseIdentity;
@@ -135,6 +136,281 @@ pub fn shuffleColumns(rng: *Random, m: *Msa) void {
             seq[i] = seq[j];
             seq[j] = tmp;
         }
+    }
+}
+
+/// Bootstrap resampling: resample columns WITH replacement to create a
+/// bootstrap alignment sample. The result has the same number of columns
+/// (alen) but columns are randomly selected with replacement.
+/// Returns a new Msa; caller owns it.
+pub fn bootstrap(allocator: Allocator, m: Msa, rng: *Random) !Msa {
+    const n = m.nseq();
+    const alen = m.alen;
+    if (alen == 0) return error.InvalidInput;
+
+    // Generate column indices by sampling with replacement.
+    const col_indices = try allocator.alloc(usize, alen);
+    defer allocator.free(col_indices);
+    for (0..alen) |i| {
+        col_indices[i] = rng.uniformInt(@intCast(alen));
+    }
+
+    // Build new names.
+    var new_names = try allocator.alloc([]const u8, n);
+    var names_done: usize = 0;
+    errdefer {
+        for (0..names_done) |i| allocator.free(new_names[i]);
+        allocator.free(new_names);
+    }
+
+    // Build new sequences.
+    var new_seqs = try allocator.alloc([]u8, n);
+    var seqs_done: usize = 0;
+    errdefer {
+        for (0..seqs_done) |i| allocator.free(new_seqs[i]);
+        allocator.free(new_seqs);
+    }
+
+    for (0..n) |i| {
+        new_names[i] = try allocator.dupe(u8, m.names[i]);
+        names_done += 1;
+
+        new_seqs[i] = try allocator.alloc(u8, alen);
+        seqs_done += 1;
+        for (0..alen) |c| {
+            new_seqs[i][c] = m.seqs[i][col_indices[c]];
+        }
+    }
+
+    // Copy per-column annotations using the same resampling.
+    var new_ss: ?[]const u8 = null;
+    errdefer if (new_ss) |s| allocator.free(s);
+    if (m.consensus_ss) |ss| {
+        const buf = try allocator.alloc(u8, alen);
+        for (0..alen) |c| buf[c] = ss[col_indices[c]];
+        new_ss = buf;
+    }
+
+    var new_rf: ?[]const u8 = null;
+    errdefer if (new_rf) |s| allocator.free(s);
+    if (m.reference) |rf| {
+        const buf = try allocator.alloc(u8, alen);
+        for (0..alen) |c| buf[c] = rf[col_indices[c]];
+        new_rf = buf;
+    }
+
+    var new_weights: ?[]f64 = null;
+    errdefer if (new_weights) |w| allocator.free(w);
+    if (m.weights) |w| {
+        new_weights = try allocator.dupe(f64, w);
+    }
+
+    return Msa{
+        .names = new_names,
+        .seqs = new_seqs,
+        .alen = alen,
+        .abc = m.abc,
+        .allocator = allocator,
+        .name = if (m.name) |v| try allocator.dupe(u8, v) else null,
+        .accession = if (m.accession) |v| try allocator.dupe(u8, v) else null,
+        .description = if (m.description) |v| try allocator.dupe(u8, v) else null,
+        .author = if (m.author) |v| try allocator.dupe(u8, v) else null,
+        .weights = new_weights,
+        .consensus_ss = new_ss,
+        .reference = new_rf,
+    };
+}
+
+/// Vertical shuffle: shuffle residues within each column independently,
+/// preserving per-column composition but destroying sequence identity.
+/// Returns a new Msa; caller owns it.
+pub fn shuffleVertical(allocator: Allocator, m: Msa, rng: *Random) !Msa {
+    const n = m.nseq();
+    const alen = m.alen;
+
+    // Build new names.
+    var new_names = try allocator.alloc([]const u8, n);
+    var names_done: usize = 0;
+    errdefer {
+        for (0..names_done) |i| allocator.free(new_names[i]);
+        allocator.free(new_names);
+    }
+
+    // Deep-copy sequences (we will shuffle in place per-column).
+    var new_seqs = try allocator.alloc([]u8, n);
+    var seqs_done: usize = 0;
+    errdefer {
+        for (0..seqs_done) |i| allocator.free(new_seqs[i]);
+        allocator.free(new_seqs);
+    }
+
+    for (0..n) |i| {
+        new_names[i] = try allocator.dupe(u8, m.names[i]);
+        names_done += 1;
+        new_seqs[i] = try allocator.dupe(u8, m.seqs[i]);
+        seqs_done += 1;
+    }
+
+    // Fisher-Yates shuffle within each column.
+    for (0..alen) |col| {
+        if (n <= 1) continue;
+        var i: usize = n - 1;
+        while (i > 0) : (i -= 1) {
+            const j = rng.uniformInt(@intCast(i + 1));
+            const tmp = new_seqs[i][col];
+            new_seqs[i][col] = new_seqs[j][col];
+            new_seqs[j][col] = tmp;
+        }
+    }
+
+    // Copy per-column annotations unchanged.
+    var new_ss: ?[]const u8 = null;
+    errdefer if (new_ss) |s| allocator.free(s);
+    if (m.consensus_ss) |ss| {
+        new_ss = try allocator.dupe(u8, ss);
+    }
+
+    var new_rf: ?[]const u8 = null;
+    errdefer if (new_rf) |s| allocator.free(s);
+    if (m.reference) |rf| {
+        new_rf = try allocator.dupe(u8, rf);
+    }
+
+    var new_weights: ?[]f64 = null;
+    errdefer if (new_weights) |w| allocator.free(w);
+    if (m.weights) |w| {
+        new_weights = try allocator.dupe(f64, w);
+    }
+
+    return Msa{
+        .names = new_names,
+        .seqs = new_seqs,
+        .alen = alen,
+        .abc = m.abc,
+        .allocator = allocator,
+        .name = if (m.name) |v| try allocator.dupe(u8, v) else null,
+        .accession = if (m.accession) |v| try allocator.dupe(u8, v) else null,
+        .description = if (m.description) |v| try allocator.dupe(u8, v) else null,
+        .author = if (m.author) |v| try allocator.dupe(u8, v) else null,
+        .weights = new_weights,
+        .consensus_ss = new_ss,
+        .reference = new_rf,
+    };
+}
+
+/// Flush-left insert regions: normalize insert columns so gaps follow
+/// residues (flush-left). Consensus columns (identified by RF annotation
+/// where the RF character is not '.' or '~') are left unchanged.
+/// If no RF annotation is present, all columns are treated as consensus
+/// and the MSA is returned unchanged (as a copy).
+/// Returns a new Msa; caller owns it.
+pub fn flushLeftInserts(allocator: Allocator, m: Msa) !Msa {
+    const n = m.nseq();
+    const alen = m.alen;
+
+    // Determine which columns are insert columns from RF annotation.
+    const rf = m.reference;
+
+    // Deep-copy names.
+    var new_names = try allocator.alloc([]const u8, n);
+    var names_done: usize = 0;
+    errdefer {
+        for (0..names_done) |i| allocator.free(new_names[i]);
+        allocator.free(new_names);
+    }
+
+    // Deep-copy sequences.
+    var new_seqs = try allocator.alloc([]u8, n);
+    var seqs_done: usize = 0;
+    errdefer {
+        for (0..seqs_done) |i| allocator.free(new_seqs[i]);
+        allocator.free(new_seqs);
+    }
+
+    for (0..n) |i| {
+        new_names[i] = try allocator.dupe(u8, m.names[i]);
+        names_done += 1;
+        new_seqs[i] = try allocator.dupe(u8, m.seqs[i]);
+        seqs_done += 1;
+    }
+
+    // If RF annotation exists, flush-left each insert block.
+    if (rf) |rf_ann| {
+        var col: usize = 0;
+        while (col < alen) {
+            // Skip consensus columns.
+            if (!isInsertColumn(rf_ann[col])) {
+                col += 1;
+                continue;
+            }
+            // Found start of an insert block.
+            const block_start = col;
+            while (col < alen and isInsertColumn(rf_ann[col])) {
+                col += 1;
+            }
+            const block_end = col;
+            const block_len = block_end - block_start;
+
+            // For each sequence, flush residues left within this block.
+            for (0..n) |seq_idx| {
+                flushLeftBlock(new_seqs[seq_idx], block_start, block_len, m.abc);
+            }
+        }
+    }
+
+    // Copy per-column annotations.
+    var new_ss: ?[]const u8 = null;
+    errdefer if (new_ss) |s| allocator.free(s);
+    if (m.consensus_ss) |ss| {
+        new_ss = try allocator.dupe(u8, ss);
+    }
+
+    var new_rf: ?[]const u8 = null;
+    errdefer if (new_rf) |s| allocator.free(s);
+    if (rf) |rf_ann| {
+        new_rf = try allocator.dupe(u8, rf_ann);
+    }
+
+    var new_weights: ?[]f64 = null;
+    errdefer if (new_weights) |w| allocator.free(w);
+    if (m.weights) |w| {
+        new_weights = try allocator.dupe(f64, w);
+    }
+
+    return Msa{
+        .names = new_names,
+        .seqs = new_seqs,
+        .alen = alen,
+        .abc = m.abc,
+        .allocator = allocator,
+        .name = if (m.name) |v| try allocator.dupe(u8, v) else null,
+        .accession = if (m.accession) |v| try allocator.dupe(u8, v) else null,
+        .description = if (m.description) |v| try allocator.dupe(u8, v) else null,
+        .author = if (m.author) |v| try allocator.dupe(u8, v) else null,
+        .weights = new_weights,
+        .consensus_ss = new_ss,
+        .reference = new_rf,
+    };
+}
+
+/// Returns true if the RF character marks an insert column.
+fn isInsertColumn(rf_char: u8) bool {
+    return rf_char == '.' or rf_char == '~';
+}
+
+/// Flush residues to the left within a block of an aligned sequence,
+/// moving all gap characters to the right end of the block.
+fn flushLeftBlock(seq: []u8, start: usize, len: usize, abc: *const Alphabet) void {
+    var write_pos: usize = 0;
+    for (0..len) |i| {
+        if (!abc.isGap(seq[start + i])) {
+            seq[start + write_pos] = seq[start + i];
+            write_pos += 1;
+        }
+    }
+    const gap = abc.gapCode();
+    while (write_pos < len) : (write_pos += 1) {
+        seq[start + write_pos] = gap;
     }
 }
 
@@ -370,4 +646,188 @@ test "shuffleColumns: single column MSA is unchanged" {
     try std.testing.expectEqual(@as(usize, 1), m.alen);
     // A = code 0
     try std.testing.expectEqual(@as(u8, 0), m.seqs[0][0]);
+}
+
+test "bootstrap: result has same dimensions as original" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+
+    const names = [_][]const u8{ "s1", "s2", "s3" };
+    const seqs = [_][]const u8{ "ACGT", "TGCA", "AACC" };
+
+    var m = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer m.deinit();
+
+    var rng = Random.init(99);
+    var bs = try bootstrap(allocator, m, &rng);
+    defer bs.deinit();
+
+    try std.testing.expectEqual(m.nseq(), bs.nseq());
+    try std.testing.expectEqual(m.alen, bs.alen);
+}
+
+test "bootstrap: each column in result comes from original" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+
+    const names = [_][]const u8{ "s1", "s2" };
+    const seqs = [_][]const u8{ "ACGT", "TGCA" };
+
+    var m = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer m.deinit();
+
+    var rng = Random.init(7);
+    var bs = try bootstrap(allocator, m, &rng);
+    defer bs.deinit();
+
+    // Each column in bs must match some column in m.
+    for (0..bs.alen) |col| {
+        var found = false;
+        for (0..m.alen) |orig_col| {
+            var matches = true;
+            for (0..m.nseq()) |seq| {
+                if (bs.seqs[seq][col] != m.seqs[seq][orig_col]) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (matches) {
+                found = true;
+                break;
+            }
+        }
+        try std.testing.expect(found);
+    }
+}
+
+test "shuffleVertical: preserves per-column composition" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+
+    const names = [_][]const u8{ "s1", "s2", "s3", "s4" };
+    const seqs = [_][]const u8{ "ACGT", "TGCA", "AACC", "GGTT" };
+
+    var m = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer m.deinit();
+
+    // Record per-column composition before shuffle.
+    var col_comp_before: [4][6]usize = undefined;
+    for (0..m.alen) |col| {
+        @memset(&col_comp_before[col], 0);
+        for (0..m.nseq()) |seq| {
+            col_comp_before[col][m.seqs[seq][col]] += 1;
+        }
+    }
+
+    var rng = Random.init(42);
+    var shuffled = try shuffleVertical(allocator, m, &rng);
+    defer shuffled.deinit();
+
+    // Per-column composition must be identical.
+    for (0..shuffled.alen) |col| {
+        var col_comp_after: [6]usize = undefined;
+        @memset(&col_comp_after, 0);
+        for (0..shuffled.nseq()) |seq| {
+            col_comp_after[shuffled.seqs[seq][col]] += 1;
+        }
+        for (0..6) |code| {
+            try std.testing.expectEqual(col_comp_before[col][code], col_comp_after[code]);
+        }
+    }
+}
+
+test "shuffleVertical: result has same dimensions" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+
+    const names = [_][]const u8{ "s1", "s2" };
+    const seqs = [_][]const u8{ "ACGT", "TGCA" };
+
+    var m = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer m.deinit();
+
+    var rng = Random.init(1);
+    var shuffled = try shuffleVertical(allocator, m, &rng);
+    defer shuffled.deinit();
+
+    try std.testing.expectEqual(m.nseq(), shuffled.nseq());
+    try std.testing.expectEqual(m.alen, shuffled.alen);
+}
+
+test "flushLeftInserts: gaps move right within insert blocks" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+
+    // 6 columns: RF = "x..x.x"
+    // Columns 0, 3, 5 are consensus (x), columns 1-2 and 4 are insert (.).
+    // s1: A--GCT  -> insert block [1,2]: "--" stays "--"; block [4]: "C" stays "C"
+    // s2: A-CGAT  -> insert block [1,2]: "-C" -> "C-"; block [4]: "A" stays "A"
+    const names = [_][]const u8{ "s1", "s2" };
+    const seqs = [_][]const u8{ "A--GCT", "A-CGAT" };
+
+    var m = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer m.deinit();
+
+    // Set RF annotation.
+    const rf_copy = try allocator.dupe(u8, "x..x.x");
+    m.reference = rf_copy;
+
+    var flushed = try flushLeftInserts(allocator, m);
+    defer flushed.deinit();
+
+    // s1 insert block [1,2] was "--" -> stays "--" (all gaps)
+    const text0 = try flushed.abc.textize(allocator, flushed.seqs[0]);
+    defer allocator.free(text0);
+    try std.testing.expectEqualStrings("A--GCT", text0);
+
+    // s2 insert block [1,2] was "-C" -> "C-" (residue flushed left)
+    const text1 = try flushed.abc.textize(allocator, flushed.seqs[1]);
+    defer allocator.free(text1);
+    try std.testing.expectEqualStrings("AC-GAT", text1);
+}
+
+test "flushLeftInserts: no RF annotation returns unchanged copy" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+
+    const names = [_][]const u8{ "s1", "s2" };
+    const seqs = [_][]const u8{ "A-GT", "ACGT" };
+
+    var m = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer m.deinit();
+
+    var flushed = try flushLeftInserts(allocator, m);
+    defer flushed.deinit();
+
+    // Without RF, no reordering should happen.
+    const text0 = try flushed.abc.textize(allocator, flushed.seqs[0]);
+    defer allocator.free(text0);
+    try std.testing.expectEqualStrings("A-GT", text0);
+
+    const text1 = try flushed.abc.textize(allocator, flushed.seqs[1]);
+    defer allocator.free(text1);
+    try std.testing.expectEqualStrings("ACGT", text1);
+}
+
+test "flushLeftInserts: multiple residues in insert block" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+
+    // RF = "x....x" -> columns 1-4 are insert.
+    // s1: A--CGT -> insert block [1,2,3,4]: "--CG" -> "CG--"
+    const names = [_][]const u8{"s1"};
+    const seqs = [_][]const u8{"A--CGT"};
+
+    var m = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer m.deinit();
+
+    const rf_copy = try allocator.dupe(u8, "x....x");
+    m.reference = rf_copy;
+
+    var flushed = try flushLeftInserts(allocator, m);
+    defer flushed.deinit();
+
+    const text = try flushed.abc.textize(allocator, flushed.seqs[0]);
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("ACG--T", text);
 }
