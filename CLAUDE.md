@@ -19,31 +19,39 @@ Minimum Zig version: **0.15.0**
 ### Module dependency graph (no cycles)
 
 ```
-alphabet
+alphabet (comptime alphabets + degeneracy tables)
    ↓
-sequence ← gencode, score_matrix
+sequence ← gencode, score_matrix, composition
    ↓
-io (fasta, stockholm, genbank, clustal, afa)
+io (fasta, stockholm, genbank, clustal, afa, phylip, a2m, psiblast, selex)
    ↓
-msa ← msa_weight, msa_ops, distance
+msa ← msa_weight, msa_ops, distance, cluster
    ↓
-ssi, dsqdata, tree, matrix, wuss
+ssi, dsqdata (+ threaded prefetch), tree, matrix, wuss
+   ↓
+ratematrix ← paml, mixdchlet
    ↓
 simd (vector_ops)
    ↓
-stats (gumbel, gamma, exponential, normal, weibull, dirichlet, histogram, minimizer, rootfinder)
+stats (gumbel, gamma, exponential, normal, weibull, dirichlet,
+       histogram, minimizer, rootfinder, functions)
+   ↓
+threads (ThreadPool, WorkQueue), cpu
    ↓
 util (random, random_seq)
+   ↓
+data structures: red_black, huffman, varint, graph, iset, recorder
 ```
 
 ### Key patterns
 
-- **Comptime alphabets**: `alphabet.dna`, `alphabet.rna`, `alphabet.amino` are fully constructed at comptime. No runtime allocation for standard alphabets.
+- **Comptime alphabets**: `alphabet.dna`, `alphabet.rna`, `alphabet.amino` are fully constructed at comptime with degeneracy bitmask tables. No runtime allocation for standard alphabets.
 - **Digital-only sequences**: Sequences store digitally encoded `[]u8`. Text representation via `alphabet.textize()`.
 - **Tagged union format dispatch**: `io.Format` enum drives reader/writer selection via switch, not vtables.
-- **Immutable MSA operations**: `selectSeqs`, `selectColumns` return new `Msa` instances.
+- **Immutable MSA operations**: `sequenceSubset`, `selectColumns`, `minimGaps`, `noGaps`, `reverseComplement` return new `Msa` instances.
 - **Comptime generics for SIMD**: `simd.VectorOps(T)` replaces Easel's per-type duplicated code.
 - **Allocator interface**: All allocating functions take `std.mem.Allocator`. No global state.
+- **Threaded pipelines**: `SequenceBlock` + `WorkQueue` + `PrefetchReader` for HMMER-style parallel I/O.
 
 ### Public API
 
@@ -51,7 +59,14 @@ All public modules are re-exported from `src/root.zig`:
 
 ```zig
 const zeasel = @import("zeasel");
-// zeasel.alphabet, zeasel.sequence, zeasel.io, zeasel.msa, etc.
+// Core: zeasel.alphabet, zeasel.sequence, zeasel.msa, zeasel.io
+// Scoring: zeasel.score_matrix, zeasel.composition
+// Trees: zeasel.tree, zeasel.distance
+// Stats: zeasel.stats (gumbel, gamma, ..., functions)
+// Models: zeasel.ratematrix, zeasel.paml, zeasel.mixdchlet
+// Data: zeasel.dsqdata, zeasel.ssi
+// Threading: zeasel.threads, zeasel.cpu
+// Structures: zeasel.matrix, zeasel.red_black, zeasel.graph, ...
 ```
 
 ## Conventions
@@ -75,3 +90,4 @@ const zeasel = @import("zeasel");
 2. Add the format variant to `io.Format` enum in `src/io/reader.zig`
 3. Add the dispatch case in `Reader` and `Writer`
 4. Add `Format.detect()` signature recognition if the format has a distinctive header
+5. Register in `src/io.zig` (pub const + test import)

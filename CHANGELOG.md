@@ -8,6 +8,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Alphabet enhancements** — degeneracy bitmask tables, `avgScore`, `expectScore`, `count`, `match`, `dealign`, `dsqrlen`, `validateSeq`, `isResidue` (#34)
+- **Sequence enhancements** — `SequenceBlock` for threaded pipelines, metadata setters (`setName`, `setAccession`, `setDescription`, `setSource`), `crcChecksum`, `countResidues`, `convertDegen2X`, `guessAlphabet`, `eql`, `isValid` (#35)
+- **MSA enhancements** — `sequenceSubset`, `minimGaps`, `noGaps`, `reverseComplement`, `convertDegen2X`, `checkUniqueNames`, `hash`, `checksum`, `validate`, `compare`, `reasonableRF`, `guessAlphabet`, annotation management (`addGF`/`addGS`/`appendGC`/`appendGR`), per-sequence metadata (#36)
+- **Score matrix enhancements** — BLOSUM45/80, PAM30/70/120/250, `getByName` lookup, `isSymmetric`, `maxScore`, `minScore`, `expectedScore`, `relativeEntropy` (#37)
+- **SSI enhancements** — alias/secondary keys, `findNumber`, multi-file indexing, `findSubseq` (#38)
+- **Tree enhancements** — `readNewick` parser, `singleLinkage`, `completeLinkage`, `wpgma` clustering (#39)
+- **Matrix enhancements** — `luDecompose`, `invert`, `exp(tQ)`, `sum`, `min`, `max`, `frobeniusNorm` (#40)
+- **Stats enhancements** — `stats/functions.zig` with `logGamma`, `psi`, `trigamma`, `erfc`, `chiSquaredTest`, `gTest`, `linearRegression`, `meanVariance` (#41)
+- **Threading** — `threads.zig` with `ThreadPool` and `WorkQueue` (producer-consumer pattern) (#42)
+- **dsqdata threading** — `PrefetchReader` with background loader thread for parallel I/O (#43)
+- **Evolutionary models** — `ratematrix.zig` (Q matrix, normalization, P=exp(tQ)), `paml.zig` (PAML format reader), `mixdchlet.zig` (mixture Dirichlet priors) (#44)
+- **Clustering** — `cluster.zig` with `singleLinkageFromDist` (#45)
+- **I/O formats** — PHYLIP (`io/phylip.zig`), A2M (`io/a2m.zig`), PSI-BLAST (`io/psiblast.zig`), SELEX (`io/selex.zig`) (#46)
+- **Data structures** — `varint.zig` (base-128 encoding), `graph.zig` (bipartite matching), `red_black.zig` (red-black tree), `huffman.zig` (Huffman coding) (#47)
+- **Utilities** — `cpu.zig` (SIMD detection), `iset.zig` (independent set splitting), `recorder.zig` (I/O recorder with rewind) (#48)
+- **Composition** — `composition.zig` with BL62, WAG, SW34, SW50 background frequencies (#37)
 - SSI (Sequence/Subsequence Index) for fast random access to sequences (#14)
 - Clustal and aligned FASTA format parsers (#10)
 - Phylogenetic tree construction (UPGMA) and Newick I/O (#13)
