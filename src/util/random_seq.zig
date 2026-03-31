@@ -81,17 +81,96 @@ pub fn shuffle(rng: *Random, dsq: []u8) void {
 /// Alias for shuffle — included for API clarity matching Easel naming.
 pub const shuffleMono = shuffle;
 
+/// Maximum alphabet size supported by the dinucleotide shuffle.
+/// Amino acid alphabets have K=20; this leaves headroom.
+const MAX_K: usize = 32;
+
 /// Shuffle preserving dinucleotide composition (Altschul-Erickson algorithm).
 ///
 /// Maintains the count of each dinucleotide pair while randomizing the
-/// sequence. k is the alphabet size (number of canonical residues).
+/// sequence.  `k` is the alphabet size (number of canonical residues).
 ///
-/// TODO: implement the full Altschul-Erickson Eulerian-path algorithm.
-/// The current placeholder falls back to a mono-nucleotide shuffle.
+/// For sequences of length 0 or 1, the sequence is unchanged.
+/// For length 2, the sequence is unchanged (only one dinucleotide).
+///
+/// Algorithm (Altschul & Erickson 1985; Easel esl_rsq_XShuffleDP):
+///   1. Count directed-edge frequencies E[i][j] from consecutive pairs.
+///   2. For each node with outgoing edges, randomly mark one edge as
+///      "last" (reserve it so an Eulerian path is guaranteed).
+///   3. Traverse from dsq[0]: at each node, pick a random non-last edge;
+///      when only the last edge remains, use it.  Append the destination
+///      residue and continue until all edges are consumed.
 pub fn shuffleDi(rng: *Random, dsq: []u8, k: u8) void {
-    _ = k;
-    // TODO: Altschul-Erickson dinucleotide shuffle via Eulerian path
-    shuffle(rng, dsq);
+    const K: usize = @intCast(k);
+    if (K > MAX_K) return; // safety guard
+    if (dsq.len <= 2) return; // nothing to shuffle
+
+    // --- Step 1: count edge frequencies E[i][j] ---
+    var E: [MAX_K][MAX_K]u16 = .{.{0} ** MAX_K} ** MAX_K;
+    for (0..dsq.len - 1) |pos| {
+        E[dsq[pos]][dsq[pos + 1]] += 1;
+    }
+
+    // --- Step 2: for each node, randomly choose one outgoing edge to be "last" ---
+    // iE[i] = the destination j of the reserved last edge from node i.
+    // We decrement E[i][j] for that edge so it won't be picked during normal traversal.
+    var iE: [MAX_K]u8 = .{0} ** MAX_K;
+    for (0..K) |i| {
+        // Count total outgoing edges from node i.
+        var total: u32 = 0;
+        for (0..K) |j| total += E[i][j];
+        if (total == 0) continue;
+
+        // Pick a random edge uniformly among all outgoing edges.
+        var pick: u32 = rng.uniformInt(total);
+        for (0..K) |j| {
+            if (E[i][j] == 0) continue;
+            if (pick < E[i][j]) {
+                iE[i] = @intCast(j);
+                E[i][j] -= 1;
+                break;
+            }
+            pick -= E[i][j];
+        }
+    }
+
+    // --- Step 3: traverse Eulerian path ---
+    var pos: usize = 0;
+    dsq[pos] = dsq[0]; // first residue stays the same
+    var x: usize = dsq[0];
+
+    while (pos < dsq.len - 2) {
+        // Count remaining (non-last) outgoing edges from x.
+        var total: u32 = 0;
+        for (0..K) |j| total += E[x][j];
+
+        if (total == 0) {
+            // Only the reserved last edge remains; use it.
+            pos += 1;
+            dsq[pos] = iE[x];
+            x = iE[x];
+        } else {
+            // Pick a random edge from the remaining ones.
+            var pick: u32 = rng.uniformInt(total);
+            for (0..K) |j| {
+                if (E[x][j] == 0) continue;
+                if (pick < E[x][j]) {
+                    pos += 1;
+                    dsq[pos] = @intCast(j);
+                    E[x][j] -= 1;
+                    x = j;
+                    break;
+                }
+                pick -= E[x][j];
+            }
+        }
+    }
+
+    // The last residue must match the original last residue.
+    // With a correct Eulerian path it is guaranteed by the reserved last edges,
+    // but we set it explicitly for clarity.  The final "last edge" from the
+    // penultimate node leads to the original last residue.
+    dsq[dsq.len - 1] = iE[x];
 }
 
 // --- Tests ---
