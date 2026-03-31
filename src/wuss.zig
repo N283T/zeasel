@@ -115,6 +115,44 @@ pub fn validate(wuss: []const u8) bool {
     return true;
 }
 
+/// Remove pseudoknot annotations from WUSS notation.
+/// Pseudoknot pairs (alphabetic Aa..Zz) are replaced with '.'.
+/// Standard bracket pairs (<>, (), [], {}) are preserved.
+pub fn noPseudo(allocator: Allocator, wuss: []const u8) ![]u8 {
+    const buf = try allocator.alloc(u8, wuss.len);
+    for (wuss, 0..) |ch, i| {
+        if ((ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z')) {
+            buf[i] = '.';
+        } else {
+            buf[i] = ch;
+        }
+    }
+    return buf;
+}
+
+/// Reverse a WUSS string: reverse order and swap open/close brackets.
+/// Useful for reverse complement of RNA secondary structure.
+pub fn reverse(allocator: Allocator, wuss: []const u8) ![]u8 {
+    const buf = try allocator.alloc(u8, wuss.len);
+    for (wuss, 0..) |ch, i| {
+        const swapped: u8 = switch (ch) {
+            '<' => '>',
+            '>' => '<',
+            '(' => ')',
+            ')' => '(',
+            '[' => ']',
+            ']' => '[',
+            '{' => '}',
+            '}' => '{',
+            'a'...'z' => ch - 32, // lowercase -> uppercase
+            'A'...'Z' => ch + 32, // uppercase -> lowercase
+            else => ch,
+        };
+        buf[wuss.len - 1 - i] = swapped;
+    }
+    return buf;
+}
+
 // --- Tests ---
 
 test "parseToPairs: ((...)) gives expected pair table" {
