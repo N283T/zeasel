@@ -135,7 +135,7 @@ pub const PrefetchReader = struct {
         errdefer allocator.destroy(self);
 
         self.* = PrefetchReader{
-            .queue = WorkQueue(*SequenceBlock).init(allocator),
+            .queue = try WorkQueue(*SequenceBlock).init(allocator, 64),
             .loader = null,
             .allocator = allocator,
         };
