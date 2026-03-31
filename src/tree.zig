@@ -32,6 +32,195 @@ pub const Tree = struct {
         for (self.names) |n| if (n) |name| self.allocator.free(name);
         self.allocator.free(self.names);
     }
+
+    /// Compare two trees for topological equivalence.
+    /// Two trees are equal if they have the same number of leaves, the same
+    /// leaf names, and the same branching pattern (same parent-child
+    /// relationships when leaves are matched by name). Branch lengths are
+    /// compared within the given tolerance.
+    /// Uses the Goodman M(g) tree-mapping function via post-order traversal
+    /// (see Easel esl_tree_Compare / Zmasek-Eddy 2001 SDI algorithm).
+    pub fn compare(self: Tree, other: Tree, tolerance: f64) bool {
+        if (self.n_leaves != other.n_leaves) return false;
+        if (self.n_nodes != other.n_nodes) return false;
+
+        const n = self.n_leaves;
+
+        // Build taxon mapping: for each leaf in self, find the matching leaf
+        // in other by name. Both trees must have leaf names.
+        var taxa_map: [256]usize = undefined;
+        if (n > 256) return false;
+        for (0..n) |a| {
+            const name_a = self.names[a] orelse return false;
+            var found: ?usize = null;
+            for (0..n) |b| {
+                const name_b = other.names[b] orelse return false;
+                if (std.mem.eql(u8, name_a, name_b)) {
+                    found = b;
+                    break;
+                }
+            }
+            taxa_map[a] = found orelse return false;
+        }
+
+        // mg maps each node in self (leaf or internal) to the corresponding
+        // node in other. For leaves, use taxa_map directly. For internal nodes,
+        // compute via post-order traversal using the SDI algorithm.
+        var mg: [256]i32 = undefined;
+        if (self.n_nodes > 256) return false;
+
+        // Initialize leaf mappings.
+        for (0..n) |i| mg[i] = @intCast(taxa_map[i]);
+
+        // Post-order traversal using a stack.
+        var order: [256]usize = undefined;
+        var order_len: usize = 0;
+        {
+            var stack: [256]usize = undefined;
+            var visited: [256]bool = undefined;
+            for (0..self.n_nodes) |i| visited[i] = false;
+            // Find root.
+            var root: usize = 0;
+            for (0..self.n_nodes) |i| {
+                if (self.parent[i] == -1) { root = i; break; }
+            }
+            var sp: usize = 0;
+            stack[sp] = root;
+            sp += 1;
+            while (sp > 0) {
+                const node = stack[sp - 1];
+                const lc = self.left[node];
+                const rc = self.right[node];
+                const lc_done = (lc < 0 or visited[@intCast(lc)]);
+                const rc_done = (rc < 0 or visited[@intCast(rc)]);
+                if (lc_done and rc_done) {
+                    order[order_len] = node;
+                    order_len += 1;
+                    visited[node] = true;
+                    sp -= 1;
+                } else {
+                    if (!rc_done) { stack[sp] = @intCast(rc); sp += 1; }
+                    if (!lc_done) { stack[sp] = @intCast(lc); sp += 1; }
+                }
+            }
+        }
+
+        // Process internal nodes in post-order.
+        for (order[0..order_len]) |node_idx| {
+            if (node_idx < n) continue; // skip leaves
+            const lc: usize = @intCast(self.left[node_idx]);
+            const rc: usize = @intCast(self.right[node_idx]);
+
+            // Find parent of each child's mapped node in other.
+            const a: i32 = if (mg[lc] >= 0) other.parent[@intCast(mg[lc])] else mg[lc];
+            const b: i32 = if (mg[rc] >= 0) other.parent[@intCast(mg[rc])] else mg[rc];
+
+            if (a != b) return false;
+            mg[node_idx] = a; // mg[node] = corresponding internal node in other
+        }
+
+        // Compare branch lengths using the mapping.
+        for (0..self.n_nodes) |i| {
+            if (self.parent[i] < 0) continue; // root, no branch to compare
+            const mapped = mg[i];
+            if (mapped < 0) continue; // mapped to root in other
+            const other_i: usize = @intCast(mapped);
+            if (other.parent[other_i] < 0) continue; // root in other
+            if (@abs(self.branch_length[i] - other.branch_length[other_i]) > tolerance) return false;
+        }
+
+        return true;
+    }
+
+    /// Validate internal consistency of the tree.
+    /// Checks: parent/child links are reciprocal, all nodes reachable from
+    /// root, no cycles, correct n_nodes/n_leaves counts, non-negative branch
+    /// lengths.
+    pub fn validate(self: Tree) bool {
+        if (self.n_nodes == 0) return false;
+        if (self.n_leaves == 0) return false;
+        if (self.n_nodes != 2 * self.n_leaves - 1) return false;
+
+        if (self.parent.len != self.n_nodes) return false;
+        if (self.left.len != self.n_nodes) return false;
+        if (self.right.len != self.n_nodes) return false;
+        if (self.branch_length.len != self.n_nodes) return false;
+        if (self.names.len != self.n_nodes) return false;
+
+        // Find root: exactly one node should have parent == -1.
+        var root_count: usize = 0;
+        var root_idx: usize = 0;
+        for (0..self.n_nodes) |i| {
+            if (self.parent[i] == -1) {
+                root_count += 1;
+                root_idx = i;
+            }
+        }
+        if (root_count != 1) return false;
+
+        // Check parent-child reciprocity for all non-root nodes.
+        for (0..self.n_nodes) |i| {
+            if (self.parent[i] < 0) continue;
+            const p: usize = @intCast(self.parent[i]);
+            if (p >= self.n_nodes) return false;
+            const is_left = (self.left[p] >= 0 and @as(usize, @intCast(self.left[p])) == i);
+            const is_right = (self.right[p] >= 0 and @as(usize, @intCast(self.right[p])) == i);
+            if (!is_left and !is_right) return false;
+        }
+
+        // Leaves have no children; internal nodes have two.
+        for (0..self.n_leaves) |i| {
+            if (self.left[i] != -1 or self.right[i] != -1) return false;
+        }
+        for (self.n_leaves..self.n_nodes) |i| {
+            if (self.left[i] < 0 or self.right[i] < 0) return false;
+            const lc: usize = @intCast(self.left[i]);
+            const rc: usize = @intCast(self.right[i]);
+            if (lc >= self.n_nodes or rc >= self.n_nodes) return false;
+        }
+
+        // BFS reachability from root and cycle detection.
+        var visited: [512]bool = undefined;
+        if (self.n_nodes > 512) return false;
+        for (0..self.n_nodes) |i| visited[i] = false;
+
+        var queue: [512]usize = undefined;
+        var head: usize = 0;
+        var tail: usize = 0;
+        queue[tail] = root_idx;
+        tail += 1;
+        visited[root_idx] = true;
+
+        while (head < tail) {
+            const node = queue[head];
+            head += 1;
+            if (self.left[node] >= 0) {
+                const child: usize = @intCast(self.left[node]);
+                if (visited[child]) return false;
+                visited[child] = true;
+                queue[tail] = child;
+                tail += 1;
+            }
+            if (self.right[node] >= 0) {
+                const child: usize = @intCast(self.right[node]);
+                if (visited[child]) return false;
+                visited[child] = true;
+                queue[tail] = child;
+                tail += 1;
+            }
+        }
+
+        for (0..self.n_nodes) |i| {
+            if (!visited[i]) return false;
+        }
+
+        // Branch lengths must be non-negative.
+        for (0..self.n_nodes) |i| {
+            if (self.branch_length[i] < 0.0) return false;
+        }
+
+        return true;
+    }
 };
 
 /// Build a UPGMA tree from a distance matrix.
@@ -630,4 +819,85 @@ test "wpgma: 3 sequences" {
 
     try std.testing.expectEqual(@as(usize, 5), tree.n_nodes);
     // WPGMA: distance from {A,B} to C = (d(A,C) + d(B,C)) / 2 = (0.8 + 0.6) / 2 = 0.7
+}
+
+test "validate: valid UPGMA tree passes" {
+    const allocator = std.testing.allocator;
+    const dist = [_]f64{
+        0.0, 0.4, 0.8,
+        0.4, 0.0, 0.8,
+        0.8, 0.8, 0.0,
+    };
+    const names = [_][]const u8{ "A", "B", "C" };
+    var tree = try upgma(allocator, &dist, 3, &names);
+    defer tree.deinit();
+    try std.testing.expect(tree.validate());
+}
+
+test "validate: valid parsed Newick tree passes" {
+    const allocator = std.testing.allocator;
+    var tree = try readNewick(allocator, "((A:0.1,B:0.2):0.3,C:0.4);");
+    defer tree.deinit();
+    try std.testing.expect(tree.validate());
+}
+
+test "validate: detects broken parent link" {
+    const allocator = std.testing.allocator;
+    var tree = try readNewick(allocator, "((A:0.1,B:0.2):0.3,C:0.4);");
+    defer tree.deinit();
+    tree.parent[0] = -1;
+    try std.testing.expect(!tree.validate());
+}
+
+test "compare: identical trees are equal" {
+    const allocator = std.testing.allocator;
+    const dist = [_]f64{
+        0.0, 0.4, 0.8,
+        0.4, 0.0, 0.8,
+        0.8, 0.8, 0.0,
+    };
+    const names = [_][]const u8{ "A", "B", "C" };
+    var t1 = try upgma(allocator, &dist, 3, &names);
+    defer t1.deinit();
+    var t2 = try upgma(allocator, &dist, 3, &names);
+    defer t2.deinit();
+    try std.testing.expect(t1.compare(t2, 1e-6));
+}
+
+test "compare: different topologies are not equal" {
+    const allocator = std.testing.allocator;
+    var t1 = try readNewick(allocator, "((A:0.1,B:0.2):0.3,C:0.4);");
+    defer t1.deinit();
+    var t2 = try readNewick(allocator, "((A:0.1,C:0.2):0.3,B:0.4);");
+    defer t2.deinit();
+    try std.testing.expect(!t1.compare(t2, 1e-6));
+}
+
+test "compare: same topology different branch lengths fails strict tolerance" {
+    const allocator = std.testing.allocator;
+    var t1 = try readNewick(allocator, "((A:0.1,B:0.2):0.3,C:0.4);");
+    defer t1.deinit();
+    var t2 = try readNewick(allocator, "((A:0.5,B:0.2):0.3,C:0.4);");
+    defer t2.deinit();
+    try std.testing.expect(!t1.compare(t2, 1e-6));
+    try std.testing.expect(t1.compare(t2, 1.0));
+}
+
+test "compare: round-trip Newick preserves topology" {
+    const allocator = std.testing.allocator;
+    const dist = [_]f64{
+        0.0, 0.6,
+        0.6, 0.0,
+    };
+    const names = [_][]const u8{ "X", "Y" };
+    var t1 = try upgma(allocator, &dist, 2, &names);
+    defer t1.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try writeNewick(t1, buf.writer(allocator).any());
+
+    var t2 = try readNewick(allocator, buf.items);
+    defer t2.deinit();
+    try std.testing.expect(t1.compare(t2, 1e-6));
 }
