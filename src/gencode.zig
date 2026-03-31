@@ -340,6 +340,198 @@ pub const pterobranchia_mito: GeneticCode = buildFromEaselArrays(24, "Pterobranc
 pub const gracilibacteria: GeneticCode = buildFromEaselArrays(25, "Candidate Division SR1 and Gracilibacteria", .{ 8, 11, 8, 11, 16, 16, 16, 16, 14, 15, 14, 15, 7, 7, 10, 7, 13, 6, 13, 6, 12, 12, 12, 12, 14, 14, 14, 14, 9, 9, 9, 9, 3, 2, 3, 2, 0, 0, 0, 0, 5, 5, 5, 5, 17, 17, 17, 17, 27, 19, 27, 19, 15, 15, 15, 15, 5, 1, 18, 1, 9, 4, 9, 4 }, .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0 });
 
 // ---------------------------------------------------------------------------
+// ORF (Open Reading Frame) finding
+// ---------------------------------------------------------------------------
+
+/// Represents a single Open Reading Frame found in a DNA sequence.
+pub const Orf = struct {
+    /// Start position in the original DNA sequence (0-based, inclusive).
+    start: usize,
+    /// End position in the original DNA sequence (0-based, exclusive, points one past last base of stop codon or sequence end).
+    end: usize,
+    /// Reading frame (0, 1, or 2).
+    frame: u2,
+    /// Which strand this ORF was found on.
+    strand: Strand,
+    /// Translated protein sequence (amino acid digital codes). Caller owns this memory.
+    protein: []u8,
+
+    pub const Strand = enum { forward, reverse };
+};
+
+/// Translate a single reading frame of a DNA digital sequence.
+///
+/// Starting at the given frame offset (0, 1, or 2), translates consecutive
+/// codons through the entire sequence. Stop codons are included in the output
+/// as STOP_CODON markers (255). Translation continues past stop codons.
+///
+/// The caller owns the returned slice.
+pub fn translateFrame(allocator: Allocator, gc: *const GeneticCode, dsq: []const u8, frame: u2) ![]u8 {
+    if (dsq.len < @as(usize, frame) + 3) {
+        return allocator.alloc(u8, 0);
+    }
+    const usable = dsq.len - @as(usize, frame);
+    const n_codons = usable / 3;
+    var result = try std.ArrayList(u8).initCapacity(allocator, n_codons);
+    errdefer result.deinit(allocator);
+
+    var pos: usize = frame;
+    while (pos + 3 <= dsq.len) {
+        if (dsq[pos] >= 4 or dsq[pos + 1] >= 4 or dsq[pos + 2] >= 4) {
+            // Degenerate/gap base: emit STOP_CODON as marker for untranslatable codon
+            try result.append(allocator, STOP_CODON);
+        } else {
+            const idx = @as(usize, dsq[pos]) * 16 + @as(usize, dsq[pos + 1]) * 4 + @as(usize, dsq[pos + 2]);
+            const aa = gc.codon_table[idx];
+            try result.append(allocator, aa);
+        }
+        pos += 3;
+    }
+
+    return result.toOwnedSlice(allocator);
+}
+
+/// Find all Open Reading Frames (ORFs) in a digital DNA sequence.
+///
+/// Scans all 3 reading frames on both the forward and reverse strands.
+/// An ORF begins at a start codon (or the beginning of the sequence if no
+/// start codon precedes the first stop) and ends at a stop codon or the end
+/// of the sequence. Only ORFs whose translated protein length is >= min_length
+/// amino acids are returned.
+///
+/// The caller owns the returned slice and each Orf's protein slice.
+pub fn findOrfs(
+    allocator: Allocator,
+    gc: *const GeneticCode,
+    abc: *const Alphabet,
+    dsq: []const u8,
+    min_length: usize,
+) ![]Orf {
+    var orfs = std.ArrayList(Orf){};
+    errdefer {
+        for (orfs.items) |orf| allocator.free(orf.protein);
+        orfs.deinit(allocator);
+    }
+
+    // Forward strand
+    try scanStrandOrfs(allocator, gc, dsq, .forward, min_length, &orfs);
+
+    // Reverse strand: make a reverse-complemented copy
+    if (abc.complement) |comp| {
+        const rc = try allocator.dupe(u8, dsq);
+        defer allocator.free(rc);
+
+        // In-place reverse complement
+        var i: usize = 0;
+        var j: usize = rc.len;
+        while (i < j) {
+            j -= 1;
+            const tmp = comp[rc[i]];
+            rc[i] = comp[rc[j]];
+            rc[j] = tmp;
+            i += 1;
+        }
+
+        try scanStrandOrfs(allocator, gc, rc, .reverse, min_length, &orfs);
+    }
+
+    return orfs.toOwnedSlice(allocator);
+}
+
+/// Scan one strand for ORFs in all 3 reading frames.
+fn scanStrandOrfs(
+    allocator: Allocator,
+    gc: *const GeneticCode,
+    dsq: []const u8,
+    strand: Orf.Strand,
+    min_length: usize,
+    orfs: *std.ArrayList(Orf),
+) !void {
+    for (0..3) |frame_idx| {
+        const frame: u2 = @intCast(frame_idx);
+        var pos: usize = frame_idx;
+
+        // Accumulate protein residues for the current ORF candidate
+        var protein_buf = std.ArrayList(u8){};
+        errdefer protein_buf.deinit(allocator);
+        var orf_start: usize = pos;
+        var seen_start = false;
+
+        while (pos + 3 <= dsq.len) {
+            const c1 = dsq[pos];
+            const c2 = dsq[pos + 1];
+            const c3 = dsq[pos + 2];
+
+            // Check for degenerate bases
+            if (c1 >= 4 or c2 >= 4 or c3 >= 4) {
+                // Treat as non-translatable; if in ORF, add unknown marker and continue
+                if (seen_start) {
+                    try protein_buf.append(allocator, STOP_CODON);
+                }
+                pos += 3;
+                continue;
+            }
+
+            const idx = @as(usize, c1) * 16 + @as(usize, c2) * 4 + @as(usize, c3);
+            const aa = gc.codon_table[idx];
+
+            if (aa == STOP_CODON) {
+                // End of ORF
+                if (seen_start and protein_buf.items.len >= min_length) {
+                    const protein = try protein_buf.toOwnedSlice(allocator);
+                    errdefer allocator.free(protein);
+                    try orfs.append(allocator, .{
+                        .start = orf_start,
+                        .end = pos + 3,
+                        .frame = frame,
+                        .strand = strand,
+                        .protein = protein,
+                    });
+                } else {
+                    protein_buf.clearRetainingCapacity();
+                }
+                // Reset for next ORF
+                seen_start = false;
+                pos += 3;
+                continue;
+            }
+
+            // Check for start codon
+            if (!seen_start and gc.is_start[idx]) {
+                seen_start = true;
+                orf_start = pos;
+                protein_buf.clearRetainingCapacity();
+                // Start codons translate to Met (M=10)
+                try protein_buf.append(allocator, 10);
+                pos += 3;
+                continue;
+            }
+
+            // Regular codon
+            if (seen_start) {
+                try protein_buf.append(allocator, aa);
+            }
+            pos += 3;
+        }
+
+        // End of sequence: emit trailing ORF if long enough
+        if (seen_start and protein_buf.items.len >= min_length) {
+            const protein = try protein_buf.toOwnedSlice(allocator);
+            errdefer allocator.free(protein);
+            try orfs.append(allocator, .{
+                .start = orf_start,
+                .end = dsq.len,
+                .frame = frame,
+                .strand = strand,
+                .protein = protein,
+            });
+        } else {
+            protein_buf.deinit(allocator);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Lookup by NCBI translation table ID
 // ---------------------------------------------------------------------------
 
@@ -624,4 +816,198 @@ test "writeTable: produces 64 codon lines" {
 
     // Should contain ATG -> M mapping
     try std.testing.expect(std.mem.indexOf(u8, buf.items, "ATG -> M") != null);
+}
+
+test "translateFrame: frame 0 translates all codons including stops" {
+    const allocator = std.testing.allocator;
+    // ATG TAA GCT = M(10) STOP(255) A(0)
+    // Digital: A=0 T=3 G=2 T=3 A=0 A=0 G=2 C=1 T=3
+    const dsq = [_]u8{ 0, 3, 2, 3, 0, 0, 2, 1, 3 };
+    const result = try translateFrame(allocator, &standard, &dsq, 0);
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 3), result.len);
+    try std.testing.expectEqual(@as(u8, 10), result[0]); // M
+    try std.testing.expectEqual(@as(u8, STOP_CODON), result[1]); // stop
+    try std.testing.expectEqual(@as(u8, 0), result[2]); // A
+}
+
+test "translateFrame: frame 1 shifts start by 1" {
+    const allocator = std.testing.allocator;
+    // Sequence: x ATG GCT ...
+    // Digital: A=0  A=0 T=3 G=2  G=2 C=1 T=3
+    const dsq = [_]u8{ 0, 0, 3, 2, 2, 1, 3 };
+    const result = try translateFrame(allocator, &standard, &dsq, 1);
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    try std.testing.expectEqual(@as(u8, 10), result[0]); // M (ATG)
+    try std.testing.expectEqual(@as(u8, 0), result[1]); // A (GCT)
+}
+
+test "translateFrame: empty for short sequence" {
+    const allocator = std.testing.allocator;
+    const dsq = [_]u8{ 0, 3 };
+    const result = try translateFrame(allocator, &standard, &dsq, 0);
+    defer allocator.free(result);
+    try std.testing.expectEqual(@as(usize, 0), result.len);
+}
+
+test "findOrfs: single forward ORF with ATG...TAA" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+
+    // ATG GCT TAT TAA = M A Y stop
+    // Digital: A=0 T=3 G=2 G=2 C=1 T=3 T=3 A=0 T=3 T=3 A=0 A=0
+    const dsq = [_]u8{ 0, 3, 2, 2, 1, 3, 3, 0, 3, 3, 0, 0 };
+    const orfs = try findOrfs(allocator, &standard, abc, &dsq, 1);
+    defer {
+        for (orfs) |orf| allocator.free(orf.protein);
+        allocator.free(orfs);
+    }
+
+    // Should find at least one forward ORF
+    var found_forward = false;
+    for (orfs) |orf| {
+        if (orf.strand == .forward and orf.frame == 0) {
+            found_forward = true;
+            try std.testing.expectEqual(@as(usize, 0), orf.start);
+            try std.testing.expectEqual(@as(usize, 12), orf.end); // past stop codon
+            try std.testing.expectEqual(@as(usize, 3), orf.protein.len);
+            try std.testing.expectEqual(@as(u8, 10), orf.protein[0]); // M
+            try std.testing.expectEqual(@as(u8, 0), orf.protein[1]); // A
+            try std.testing.expectEqual(@as(u8, 19), orf.protein[2]); // Y
+        }
+    }
+    try std.testing.expect(found_forward);
+}
+
+test "findOrfs: min_length filters short ORFs" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+
+    // ATG TAA = M stop (protein length 1)
+    // Digital: A=0 T=3 G=2 T=3 A=0 A=0
+    const dsq = [_]u8{ 0, 3, 2, 3, 0, 0 };
+
+    // min_length=2 should filter it out (forward frame 0 only has 1 aa)
+    const orfs = try findOrfs(allocator, &standard, abc, &dsq, 2);
+    defer {
+        for (orfs) |orf| allocator.free(orf.protein);
+        allocator.free(orfs);
+    }
+
+    var has_frame0_fwd = false;
+    for (orfs) |orf| {
+        if (orf.strand == .forward and orf.frame == 0) has_frame0_fwd = true;
+    }
+    try std.testing.expect(!has_frame0_fwd);
+}
+
+test "findOrfs: reverse strand ORFs are found" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+
+    // Forward: TTA TAG GCC CAT (no start codon in frame 0)
+    // Reverse complement: ATG GGC CTA TAA -> M G L stop
+    // Digital forward: T=3 T=3 A=0 T=3 A=0 G=2 G=2 C=1 C=1 C=1 A=0 T=3
+    const dsq = [_]u8{ 3, 3, 0, 3, 0, 2, 2, 1, 1, 1, 0, 3 };
+    const orfs = try findOrfs(allocator, &standard, abc, &dsq, 1);
+    defer {
+        for (orfs) |orf| allocator.free(orf.protein);
+        allocator.free(orfs);
+    }
+
+    var found_reverse = false;
+    for (orfs) |orf| {
+        if (orf.strand == .reverse and orf.frame == 0) {
+            found_reverse = true;
+            try std.testing.expectEqual(@as(usize, 3), orf.protein.len);
+            try std.testing.expectEqual(@as(u8, 10), orf.protein[0]); // M
+        }
+    }
+    try std.testing.expect(found_reverse);
+}
+
+test "findOrfs: ORF at end of sequence without stop codon" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+
+    // ATG GCT GCT (no stop codon) -> M A A (length 3)
+    // Digital: A=0 T=3 G=2 G=2 C=1 T=3 G=2 C=1 T=3
+    const dsq = [_]u8{ 0, 3, 2, 2, 1, 3, 2, 1, 3 };
+    const orfs = try findOrfs(allocator, &standard, abc, &dsq, 1);
+    defer {
+        for (orfs) |orf| allocator.free(orf.protein);
+        allocator.free(orfs);
+    }
+
+    var found = false;
+    for (orfs) |orf| {
+        if (orf.strand == .forward and orf.frame == 0) {
+            found = true;
+            try std.testing.expectEqual(@as(usize, 0), orf.start);
+            try std.testing.expectEqual(@as(usize, 9), orf.end); // end of sequence
+            try std.testing.expectEqual(@as(usize, 3), orf.protein.len);
+            try std.testing.expectEqual(@as(u8, 10), orf.protein[0]); // M
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "findOrfs: multiple ORFs in different frames" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+
+    // Build a sequence that has ORFs in frame 0 and frame 1
+    // Frame 0: ATG GCT TAA ... (M A stop)
+    // Frame 1:  TGG CTT AA... (no start in frame 1)
+    // We need something starting with ATG in frame 1 too.
+    // So: x ATG GCT TAA where x is a single base
+    // Frame 0 from pos 0: xAT GGC TTA A -> no start
+    // Frame 1 from pos 1: ATG GCT TAA   -> M A stop
+    // Let x = G:
+    // G=2, A=0, T=3, G=2, G=2, C=1, T=3, T=3, A=0, A=0
+    // Frame 0: GAT(D=2) GGC(G=5) TTA(L=9) A -- no ATG start
+    // Frame 1: ATG(M=10) GCT(A=0) TAA(stop)
+    const dsq = [_]u8{ 2, 0, 3, 2, 2, 1, 3, 3, 0, 0 };
+    const orfs = try findOrfs(allocator, &standard, abc, &dsq, 1);
+    defer {
+        for (orfs) |orf| allocator.free(orf.protein);
+        allocator.free(orfs);
+    }
+
+    var found_frame1 = false;
+    for (orfs) |orf| {
+        if (orf.strand == .forward and orf.frame == 1) {
+            found_frame1 = true;
+            try std.testing.expectEqual(@as(u8, 10), orf.protein[0]); // M
+        }
+    }
+    try std.testing.expect(found_frame1);
+}
+
+test "findOrfs: start codon translates to Met" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+
+    // CTG is a start codon in standard code but normally translates to Leu.
+    // In ORF finding, start codons should translate to Met (M=10).
+    // CTG GCT TAA
+    // Digital: C=1 T=3 G=2 G=2 C=1 T=3 T=3 A=0 A=0
+    const dsq = [_]u8{ 1, 3, 2, 2, 1, 3, 3, 0, 0 };
+    const orfs = try findOrfs(allocator, &standard, abc, &dsq, 1);
+    defer {
+        for (orfs) |orf| allocator.free(orf.protein);
+        allocator.free(orfs);
+    }
+
+    var found = false;
+    for (orfs) |orf| {
+        if (orf.strand == .forward and orf.frame == 0) {
+            found = true;
+            try std.testing.expectEqual(@as(u8, 10), orf.protein[0]); // M, not L
+        }
+    }
+    try std.testing.expect(found);
 }
