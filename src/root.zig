@@ -7,6 +7,7 @@ pub const simd = @import("simd.zig");
 pub const stats = @import("stats.zig");
 pub const score_matrix = @import("score_matrix.zig");
 pub const util = @import("util.zig");
+pub const distance = @import("distance.zig");
 
 // Include tests from all sub-modules in `zig build test`.
 test {
@@ -19,4 +20,5 @@ test {
     _ = stats;
     _ = score_matrix;
     _ = util;
+    _ = distance;
 }
