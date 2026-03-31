@@ -20,12 +20,18 @@ pub fn percentIdentity(abc: *const Alphabet, seq1: []const u8, seq2: []const u8)
     return @as(f64, @floatFromInt(matches)) / @as(f64, @floatFromInt(compared));
 }
 
-/// Jukes-Cantor distance correction: d = -3/4 * ln(1 - 4/3 * D)
-/// where D = 1 - percent_identity. Returns inf if D >= 0.75.
-pub fn jukesCantor(pid: f64) f64 {
+/// Generalized Jukes-Cantor distance correction:
+///   d = -((K-1)/K) * ln(1 - D*K/(K-1))
+/// where D = 1 - percent_identity and K = alphabet_size.
+/// For DNA, K=4 gives the classic -3/4 * ln(1 - 4/3 * D).
+/// For protein, K=20. Returns inf if the argument to ln is <= 0.
+pub fn jukesCantor(pid: f64, alphabet_size: u32) f64 {
+    const k: f64 = @floatFromInt(alphabet_size);
     const d = 1.0 - pid;
-    if (d >= 0.75) return std.math.inf(f64);
-    return -0.75 * @log(1.0 - (4.0 / 3.0) * d);
+    const scale = (k - 1.0) / k;
+    const arg = 1.0 - d / scale;
+    if (arg <= 0.0) return std.math.inf(f64);
+    return -scale * @log(arg);
 }
 
 /// Kimura protein distance correction: d = -ln(1 - D - 0.2*D^2)
@@ -51,7 +57,7 @@ pub fn pairwiseDistanceMatrix(allocator: Allocator, m: Msa, correction: Correcti
             const pid = percentIdentity(m.abc, m.seqs[i], m.seqs[j]);
             const dist = switch (correction) {
                 .none => 1.0 - pid,
-                .jukes_cantor => jukesCantor(pid),
+                .jukes_cantor => jukesCantor(pid, m.abc.k),
                 .kimura => kimura(pid),
             };
             matrix[i * n + j] = dist;
@@ -103,22 +109,28 @@ test "percentIdentity: all gaps returns 0.0" {
     try std.testing.expectApproxEqAbs(@as(f64, 0.0), pid, 1e-10);
 }
 
-test "jukesCantor: pid=1.0 gives distance 0.0" {
-    const d = jukesCantor(1.0);
+test "jukesCantor: DNA pid=1.0 gives distance 0.0" {
+    const d = jukesCantor(1.0, 4);
     try std.testing.expectApproxEqAbs(@as(f64, 0.0), d, 1e-10);
 }
 
-test "jukesCantor: pid=0.7 gives known value" {
-    // D = 1 - 0.7 = 0.3; d = -0.75 * ln(1 - 4/3 * 0.3) = -0.75 * ln(1 - 0.4) = -0.75 * ln(0.6)
+test "jukesCantor: DNA pid=0.7 gives known value" {
+    // D = 0.3; d = -0.75 * ln(1 - 4/3 * 0.3) = -0.75 * ln(0.6)
     const expected = -0.75 * @log(1.0 - (4.0 / 3.0) * 0.3);
-    const d = jukesCantor(0.7);
+    const d = jukesCantor(0.7, 4);
     try std.testing.expectApproxEqAbs(expected, d, 1e-10);
 }
 
-test "jukesCantor: pid<=0.25 gives inf" {
-    // D >= 0.75 -> inf
-    try std.testing.expectEqual(std.math.inf(f64), jukesCantor(0.25));
-    try std.testing.expectEqual(std.math.inf(f64), jukesCantor(0.0));
+test "jukesCantor: DNA pid<=0.25 gives inf" {
+    try std.testing.expectEqual(std.math.inf(f64), jukesCantor(0.25, 4));
+    try std.testing.expectEqual(std.math.inf(f64), jukesCantor(0.0, 4));
+}
+
+test "jukesCantor: protein K=20 gives correct value" {
+    // d = -(19/20) * ln(1 - D*20/19), D = 0.5
+    const expected = -(19.0 / 20.0) * @log(1.0 - 0.5 * 20.0 / 19.0);
+    const d = jukesCantor(0.5, 20);
+    try std.testing.expectApproxEqAbs(expected, d, 1e-10);
 }
 
 test "kimura: pid=1.0 gives distance 0.0" {

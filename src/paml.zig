@@ -22,9 +22,31 @@ pub const PamlModel = struct {
     }
 };
 
+// PAML files use alphabetical-by-3-letter-code order: ARNDCQEGHILKMFPSTWYV
+// zeasel (like Easel) uses alphabetical-by-1-letter-code: ACDEFGHIKLMNPQRSTVWY
+// This table maps PAML index -> zeasel index.
+const paml_to_zeasel: [20]usize = buildPermutation();
+
+fn buildPermutation() [20]usize {
+    const paml_order = "ARNDCQEGHILKMFPSTWYV";
+    const zeasel_order = "ACDEFGHIKLMNPQRSTVWY";
+    var perm: [20]usize = undefined;
+    for (paml_order, 0..) |c, i| {
+        for (zeasel_order, 0..) |z, j| {
+            if (c == z) {
+                perm[i] = j;
+                break;
+            }
+        }
+    }
+    return perm;
+}
+
 /// Parse a PAML-format amino acid model from text.
 /// Expects 190 exchangeability values (lower triangle, row by row)
 /// followed by 20 frequency values.
+/// Values are permuted from PAML order (ARNDCQEGHILKMFPSTWYV) to
+/// zeasel alphabet order (ACDEFGHIKLMNPQRSTVWY).
 pub fn parse(allocator: Allocator, data: []const u8) !PamlModel {
     var s = try Matrix.init(allocator, 20, 20);
     errdefer s.deinit();
@@ -32,20 +54,23 @@ pub fn parse(allocator: Allocator, data: []const u8) !PamlModel {
     var it = std.mem.tokenizeAny(u8, data, " \t\n\r");
 
     // Read 190 lower-triangle values: S[i][j] for i=1..19, j=0..i-1
+    // Permute from PAML order to zeasel order as we read.
     for (1..20) |i| {
         for (0..i) |j| {
             const token = it.next() orelse return error.InvalidFormat;
             const val = std.fmt.parseFloat(f64, token) catch return error.InvalidFormat;
-            s.set(i, j, val);
-            s.set(j, i, val); // symmetric
+            const pi = paml_to_zeasel[i];
+            const pj = paml_to_zeasel[j];
+            s.set(pi, pj, val);
+            s.set(pj, pi, val); // symmetric
         }
     }
 
-    // Read 20 frequencies
+    // Read 20 frequencies, permuting from PAML order to zeasel order.
     var freq: [20]f64 = undefined;
     for (0..20) |i| {
         const token = it.next() orelse return error.InvalidFormat;
-        freq[i] = std.fmt.parseFloat(f64, token) catch return error.InvalidFormat;
+        freq[paml_to_zeasel[i]] = std.fmt.parseFloat(f64, token) catch return error.InvalidFormat;
     }
 
     return PamlModel{
@@ -81,10 +106,16 @@ test "parse: minimal 4-residue-like format (using 20x20)" {
 
     // S should be symmetric
     try std.testing.expect(model.exchangeability.isSymmetric(1e-10));
-    // S[1][0] should be the first value (1.0)
-    try std.testing.expectApproxEqAbs(@as(f64, 1.0), model.exchangeability.get(1, 0), 1e-10);
-    // S[0][1] should equal S[1][0]
-    try std.testing.expectApproxEqAbs(model.exchangeability.get(1, 0), model.exchangeability.get(0, 1), 1e-10);
+    // First value (1.0) is S_paml[1][0] = S(R,A).
+    // PAML R -> zeasel index 14, PAML A -> zeasel index 0.
+    // So S_zeasel[14][0] should be 1.0.
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), model.exchangeability.get(paml_to_zeasel[1], paml_to_zeasel[0]), 1e-10);
+    // Should be symmetric
+    try std.testing.expectApproxEqAbs(
+        model.exchangeability.get(paml_to_zeasel[1], paml_to_zeasel[0]),
+        model.exchangeability.get(paml_to_zeasel[0], paml_to_zeasel[1]),
+        1e-10,
+    );
     // Frequencies should sum to 1
     var sum: f64 = 0;
     for (model.frequencies) |f| sum += f;

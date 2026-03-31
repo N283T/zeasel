@@ -191,12 +191,18 @@ pub const Sequence = struct {
 
     // --- Utilities ---
 
-    /// Compute a CRC32 checksum of the digital sequence data.
-    pub fn crcChecksum(self: Sequence) u32 {
+    /// Compute a checksum of the digital sequence data using Jenkins one-at-a-time hash.
+    /// Compatible with Easel's esl_sq_Checksum().
+    pub fn checksum(self: Sequence) u32 {
         var val: u32 = 0;
         for (self.dsq) |code| {
-            val = val *% 31 +% @as(u32, code);
+            val +%= @as(u32, code);
+            val +%= val << 10;
+            val ^= val >> 6;
         }
+        val +%= val << 3;
+        val ^= val >> 11;
+        val +%= val << 15;
         return val;
     }
 
@@ -477,24 +483,24 @@ test "setSource" {
     try std.testing.expectEqual(@as(i64, 200), seq.source.?.end);
 }
 
-test "crcChecksum: deterministic" {
+test "checksum: deterministic" {
     const allocator = std.testing.allocator;
     var seq = try Sequence.fromText(allocator, &alphabet_mod.dna, "seq1", "ACGT");
     defer seq.deinit();
 
-    const c1 = seq.crcChecksum();
-    const c2 = seq.crcChecksum();
+    const c1 = seq.checksum();
+    const c2 = seq.checksum();
     try std.testing.expectEqual(c1, c2);
 }
 
-test "crcChecksum: different sequences differ" {
+test "checksum: different sequences differ" {
     const allocator = std.testing.allocator;
     var s1 = try Sequence.fromText(allocator, &alphabet_mod.dna, "a", "ACGT");
     defer s1.deinit();
     var s2 = try Sequence.fromText(allocator, &alphabet_mod.dna, "b", "TGCA");
     defer s2.deinit();
 
-    try std.testing.expect(s1.crcChecksum() != s2.crcChecksum());
+    try std.testing.expect(s1.checksum() != s2.checksum());
 }
 
 test "countResidues: AACG -> 2A, 1C, 1G" {

@@ -7,25 +7,7 @@
 /// PDF: (1/(sigma*sqrt(2*pi))) * exp(-(x-mu)^2 / (2*sigma^2))
 const std = @import("std");
 const math = std.math;
-
-// Rational approximation coefficients for erf (Abramowitz & Stegun 7.1.26)
-// Maximum error: |epsilon(x)| <= 1.5e-7
-const erf_p = 0.3275911;
-const erf_a1 = 0.254829592;
-const erf_a2 = -0.284496736;
-const erf_a3 = 1.421413741;
-const erf_a4 = -1.453152027;
-const erf_a5 = 1.061405429;
-
-/// Approximate error function using Abramowitz & Stegun 7.1.26.
-/// Max absolute error <= 1.5e-7.
-fn erf(x: f64) f64 {
-    const sign: f64 = if (x < 0.0) -1.0 else 1.0;
-    const ax = @abs(x);
-    const t = 1.0 / (1.0 + erf_p * ax);
-    const poly = t * (erf_a1 + t * (erf_a2 + t * (erf_a3 + t * (erf_a4 + t * erf_a5))));
-    return sign * (1.0 - poly * @exp(-ax * ax));
-}
+const c_math = @cImport(@cInclude("math.h"));
 
 /// PDF: (1/(sigma*sqrt(2*pi))) * exp(-(x-mu)^2 / (2*sigma^2))
 pub fn pdf(x: f64, mu: f64, sigma: f64) f64 {
@@ -39,14 +21,18 @@ pub fn logPdf(x: f64, mu: f64, sigma: f64) f64 {
     return -0.5 * @log(2.0 * math.pi) - @log(sigma) - 0.5 * z * z;
 }
 
-/// CDF using error function: 0.5 * (1 + erf((x-mu) / (sigma*sqrt(2))))
+/// CDF using erfc to avoid cancellation in tails.
+/// CDF(x) = 0.5 * erfc(-(x-mu) / (sigma*sqrt(2)))
 pub fn cdf(x: f64, mu: f64, sigma: f64) f64 {
-    return 0.5 * (1.0 + erf((x - mu) / (sigma * @sqrt(2.0))));
+    const z = (x - mu) / (sigma * @sqrt(2.0));
+    return 0.5 * c_math.erfc(-z);
 }
 
-/// Survival function: 1 - CDF
+/// Survival function using erfc to avoid cancellation in tails.
+/// surv(x) = 0.5 * erfc((x-mu) / (sigma*sqrt(2)))
 pub fn surv(x: f64, mu: f64, sigma: f64) f64 {
-    return 1.0 - cdf(x, mu, sigma);
+    const z = (x - mu) / (sigma * @sqrt(2.0));
+    return 0.5 * c_math.erfc(z);
 }
 
 // Rational approximation coefficients for the standard normal inverse CDF.

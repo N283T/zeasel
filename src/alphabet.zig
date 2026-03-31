@@ -459,16 +459,17 @@ const amino_synonyms: []const [2]u8 = &.{
 };
 
 // Amino acid degeneracies:
-//   B(21) = D|N (bits 2,11), J(22) = I|L (bits 7,9),
-//   Z(23) = E|Q (bits 3,13), O(24) = pyrrolysine (maps to all 20 as unknown-like),
-//   U(25) = selenocysteine (maps to all 20 as unknown-like),
+//   B(21) = D|N, J(22) = I|L, Z(23) = E|Q,
+//   O(24) = pyrrolysine (maps to K), U(25) = selenocysteine (maps to C),
 //   X(26) = any (all 20)
+// Alphabet order: ACDEFGHIKLMNPQRSTVWY (indices 0-19)
+//   C=1, K=9
 const amino_degen = buildDegenTable(20, 29, &.{
     .{ 21, (1 << 2) | (1 << 11) },        // B = D|N
     .{ 22, (1 << 7) | (1 << 9) },         // J = I|L
     .{ 23, (1 << 3) | (1 << 13) },        // Z = E|Q
-    .{ 24, (1 << 20) - 1 },               // O = all 20 (treated as unknown-like)
-    .{ 25, (1 << 20) - 1 },               // U = all 20 (treated as unknown-like)
+    .{ 24, 1 << 9 },                      // O = K (pyrrolysine)
+    .{ 25, 1 << 1 },                      // U = C (selenocysteine)
     .{ 26, (1 << 20) - 1 },               // X = all 20
 });
 

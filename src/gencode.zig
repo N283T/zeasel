@@ -167,9 +167,11 @@ pub const standard: GeneticCode = blk: {
         }
     }
 
-    // ATG is the canonical start codon.
-    // A=0, T=3, G=2 -> index = 0*16 + 3*4 + 2 = 14
-    starts[codonIndex(0, 3, 2)] = true; // ATG
+    // Standard code initiator codons (NCBI translation table 1):
+    // ATG, CTG, TTG
+    starts[codonIndex(0, 3, 2)] = true; // ATG: A=0, T=3, G=2
+    starts[codonIndex(1, 3, 2)] = true; // CTG: C=1, T=3, G=2
+    starts[codonIndex(3, 3, 2)] = true; // TTG: T=3, T=3, G=2
 
     break :blk GeneticCode{
         .codon_table = table,

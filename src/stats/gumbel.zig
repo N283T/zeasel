@@ -27,9 +27,15 @@ pub fn cdf(x: f64, mu: f64, lambda: f64) f64 {
     return @exp(-@exp(-z));
 }
 
-/// Survival function: 1 - CDF
+/// Survival function: 1 - exp(-exp(-z)).
+/// When exp(-z) is small, uses first-order approximation exp(-z) to avoid
+/// precision loss from 1.0 - (value near 1.0).
 pub fn surv(x: f64, mu: f64, lambda: f64) f64 {
-    return 1.0 - cdf(x, mu, lambda);
+    const z = lambda * (x - mu);
+    const ey = @exp(-z);
+    // When ey is small, 1 - exp(-ey) ~ ey (first-order Taylor)
+    if (ey < 1e-7) return ey;
+    return -math.expm1(-ey);
 }
 
 /// Log survival: log(1 - exp(-exp(-z)))
