@@ -8,6 +8,7 @@ pub const msa_ops = @import("msa_ops.zig");
 pub const simd = @import("simd.zig");
 pub const stats = @import("stats.zig");
 pub const score_matrix = @import("score_matrix.zig");
+pub const composition = @import("composition.zig");
 pub const util = @import("util.zig");
 pub const distance = @import("distance.zig");
 pub const gencode = @import("gencode.zig");
@@ -28,6 +29,7 @@ test {
     _ = simd;
     _ = stats;
     _ = score_matrix;
+    _ = composition;
     _ = util;
     _ = distance;
     _ = gencode;
