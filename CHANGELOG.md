@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **SSI dual-format support** — Read both zeasel native and Easel SSI v3.0 index formats, auto-detected by magic bytes. Easel SSI uses disk-based binary search for O(log n) lookup without loading keys into memory (#63)
 - **Comprehensive Easel review** — 58 issues identified and fixed via systematic comparison with Easel C source (#61-#72, PRs #73-#101)
 
 ### Fixed (Easel review — CRITICAL)

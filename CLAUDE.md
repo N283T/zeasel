@@ -53,7 +53,8 @@ data structures: red_black, huffman, varint, graph, iset, recorder
 - **Allocator interface**: All allocating functions take `std.mem.Allocator`. No global state.
 - **Threaded pipelines**: `SequenceBlock` + `WorkQueue`/`DualWorkQueue` + `PrefetchReader` for HMMER-style parallel I/O.
 - **Immutable conventions**: `Matrix.scale()`, MSA operations, and similar return new objects. No in-place mutation.
-- **Easel compatibility**: Jenkins checksums, PAML alphabet permutation, MIN(len1,len2) percent identity, erfc-based normal CDF. Binary formats (dsqdata, SSI) use independent zeasel formats.
+- **Easel compatibility**: Jenkins checksums, PAML alphabet permutation, MIN(len1,len2) percent identity, erfc-based normal CDF. Binary formats use independent zeasel formats (dsqdata), except SSI which reads both zeasel and Easel v3.0 formats.
+- **Dual SSI format**: `SsiIndex` is a tagged union of `ZeaselIndex` (in-memory HashMap) and `EaselIndex` (disk-based binary search). Format auto-detected by magic bytes.
 
 ### Public API
 
