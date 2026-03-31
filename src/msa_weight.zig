@@ -7,14 +7,19 @@ const Msa = @import("msa.zig").Msa;
 /// Compute position-based (PB/Henikoff & Henikoff 1994) weights for an MSA.
 ///
 /// For each alignment column:
-///   - Count r: the number of distinct residue types (gaps excluded).
+///   - Count r: the number of distinct canonical residue types
+///     (gaps and degenerate codes are excluded).
 ///   - For each residue type, count n: how many sequences carry that residue.
 ///   - Each sequence at that column contributes 1 / (r * n) to its weight.
-/// Weights are normalized so that they sum to nseq.
+///
+/// After accumulation, each weight is divided by the sequence's residue
+/// count (per-sequence-length normalization, matching Easel's
+/// esl_msaweight_PB_adv). Then weights are normalized to sum to nseq.
 ///
 /// Returns an allocated slice of length nseq. Caller owns the memory.
 pub fn positionBased(allocator: Allocator, m: Msa) ![]f64 {
     const n = m.nseq();
+    const k = m.abc.k; // number of canonical residue codes
     const weights = try allocator.alloc(f64, n);
     @memset(weights, 0.0);
 
@@ -22,31 +27,43 @@ pub fn positionBased(allocator: Allocator, m: Msa) ![]f64 {
     const MAX_KP = 30;
 
     for (0..m.alen) |col| {
-        // Count occurrences of each digital code in this column (skip gaps).
+        // Count occurrences of each digital code in this column.
+        // Only canonical residues (code < K) are counted; degenerate
+        // codes (>= K), gaps, missing, and nonresidues are ignored.
         var type_counts: [MAX_KP]u32 = .{0} ** MAX_KP;
         for (0..n) |seq| {
             const code = m.seqs[seq][col];
-            if (!m.abc.isGap(code)) {
+            if (code < k) {
                 type_counts[code] += 1;
             }
         }
 
-        // Count how many distinct residue types are present.
+        // Count how many distinct canonical types are present.
         var r: u32 = 0;
-        for (type_counts[0..m.abc.kp]) |c| {
+        for (type_counts[0..k]) |c| {
             if (c > 0) r += 1;
         }
-        if (r == 0) continue; // all-gap column
+        if (r == 0) continue; // all-gap/degenerate column
 
-        // Accumulate weight contribution for each non-gap sequence.
+        // Accumulate weight contribution for each canonical-residue sequence.
         for (0..n) |seq| {
             const code = m.seqs[seq][col];
-            if (!m.abc.isGap(code)) {
+            if (code < k) {
                 const n_i: f64 = @floatFromInt(type_counts[code]);
                 const r_f: f64 = @floatFromInt(r);
                 weights[seq] += 1.0 / (r_f * n_i);
             }
         }
+    }
+
+    // Per-sequence-length normalization: divide each weight by the number
+    // of canonical residues in that sequence (matching Easel's behavior).
+    for (0..n) |seq| {
+        var rlen: u32 = 0;
+        for (0..m.alen) |col| {
+            if (m.seqs[seq][col] < k) rlen += 1;
+        }
+        if (rlen > 0) weights[seq] /= @floatFromInt(rlen);
     }
 
     // Normalize so that weights sum to nseq.
