@@ -161,6 +161,70 @@ pub const HuffmanCode = struct {
         return weighted / total_freq;
     }
 
+    /// Encode a sequence of symbols into a packed bitstream.
+    /// Returns the packed bytes and the total number of valid bits.
+    pub fn encode(self: HuffmanCode, allocator: Allocator, symbols: []const u8) !struct { data: []u8, nbits: usize } {
+        // Compute total bits needed
+        var total_bits: usize = 0;
+        for (symbols) |s| {
+            if (s >= self.n_symbols) return error.InvalidSymbol;
+            total_bits += @as(usize, self.lengths[s]);
+        }
+        const nbytes = (total_bits + 7) / 8;
+        const data = try allocator.alloc(u8, nbytes);
+        @memset(data, 0);
+
+        var bit_pos: usize = 0;
+        for (symbols) |s| {
+            const code = self.codes[s];
+            const len = @as(usize, self.lengths[s]);
+            // Write bits MSB-first
+            for (0..len) |b| {
+                const bit: u1 = @intCast((code >> @intCast(len - 1 - b)) & 1);
+                if (bit == 1) {
+                    data[bit_pos / 8] |= @as(u8, 1) << @intCast(7 - (bit_pos % 8));
+                }
+                bit_pos += 1;
+            }
+        }
+
+        return .{ .data = data, .nbits = total_bits };
+    }
+
+    /// Decode a packed bitstream back into symbols.
+    /// `nbits` is the number of valid bits in the stream.
+    /// Returns the decoded symbol sequence.
+    pub fn decode(self: HuffmanCode, allocator: Allocator, data: []const u8, nbits: usize) ![]u8 {
+        // Build decode lookup: for each (code, length) pair -> symbol
+        // Use a simple linear scan approach (sufficient for small alphabets).
+        var result: std.ArrayList(u8) = .empty;
+        errdefer result.deinit(allocator);
+
+        var bit_pos: usize = 0;
+        while (bit_pos < nbits) {
+            var code: u32 = 0;
+            var found = false;
+            for (1..32) |len| {
+                if (bit_pos >= nbits) break;
+                const bit: u32 = @intCast((data[bit_pos / 8] >> @intCast(7 - (bit_pos % 8))) & 1);
+                code = (code << 1) | bit;
+                bit_pos += 1;
+                // Check if any symbol matches this code and length
+                for (0..self.n_symbols) |s| {
+                    if (self.lengths[s] == @as(u5, @intCast(len)) and self.codes[s] == code) {
+                        try result.append(allocator, @intCast(s));
+                        found = true;
+                        break;
+                    }
+                }
+                if (found) break;
+            }
+            if (!found) return error.InvalidBitstream;
+        }
+
+        return result.toOwnedSlice(allocator);
+    }
+
     pub fn deinit(self: *HuffmanCode) void {
         self.allocator.free(self.codes);
         self.allocator.free(self.lengths);
@@ -204,6 +268,38 @@ test "build: 2 symbols" {
     try std.testing.expectEqual(@as(u5, 1), hc.lengths[1]);
     // Codes should be 0 and 1
     try std.testing.expect(hc.codes[0] != hc.codes[1]);
+}
+
+test "encode/decode: round trip" {
+    const allocator = std.testing.allocator;
+    const freq = [_]f64{ 10.0, 5.0, 2.0, 1.0 };
+    var hc = try HuffmanCode.build(allocator, &freq);
+    defer hc.deinit();
+
+    const symbols = [_]u8{ 0, 1, 2, 3, 0, 0, 1, 3, 2 };
+    const encoded = try hc.encode(allocator, &symbols);
+    defer allocator.free(encoded.data);
+
+    const decoded = try hc.decode(allocator, encoded.data, encoded.nbits);
+    defer allocator.free(decoded);
+
+    try std.testing.expectEqualSlices(u8, &symbols, decoded);
+}
+
+test "encode/decode: single symbol repeated" {
+    const allocator = std.testing.allocator;
+    const freq = [_]f64{ 100.0, 1.0 };
+    var hc = try HuffmanCode.build(allocator, &freq);
+    defer hc.deinit();
+
+    const symbols = [_]u8{ 0, 0, 0, 0 };
+    const encoded = try hc.encode(allocator, &symbols);
+    defer allocator.free(encoded.data);
+
+    const decoded = try hc.decode(allocator, encoded.data, encoded.nbits);
+    defer allocator.free(decoded);
+
+    try std.testing.expectEqualSlices(u8, &symbols, decoded);
 }
 
 test "avgLength: uniform 4 symbols = 2 bits" {
