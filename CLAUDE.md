@@ -23,7 +23,7 @@ alphabet (comptime alphabets + degeneracy tables)
    ↓
 sequence ← gencode, score_matrix, composition
    ↓
-io (fasta, stockholm, genbank, clustal, afa, phylip, a2m, psiblast, selex)
+io (fasta, stockholm, genbank, clustal, afa, phylip, a2m, psiblast, selex, window_reader)
    ↓
 msa ← msa_weight, msa_ops, distance, cluster
    ↓
@@ -51,7 +51,9 @@ data structures: red_black, huffman, varint, graph, iset, recorder
 - **Immutable MSA operations**: `sequenceSubset`, `selectColumns`, `minimGaps`, `noGaps`, `reverseComplement` return new `Msa` instances.
 - **Comptime generics for SIMD**: `simd.VectorOps(T)` replaces Easel's per-type duplicated code.
 - **Allocator interface**: All allocating functions take `std.mem.Allocator`. No global state.
-- **Threaded pipelines**: `SequenceBlock` + `WorkQueue` + `PrefetchReader` for HMMER-style parallel I/O.
+- **Threaded pipelines**: `SequenceBlock` + `WorkQueue`/`DualWorkQueue` + `PrefetchReader` for HMMER-style parallel I/O.
+- **Immutable conventions**: `Matrix.scale()`, MSA operations, and similar return new objects. No in-place mutation.
+- **Easel compatibility**: Jenkins checksums, PAML alphabet permutation, MIN(len1,len2) percent identity, erfc-based normal CDF. Binary formats (dsqdata, SSI) use independent zeasel formats.
 
 ### Public API
 
