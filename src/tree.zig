@@ -261,13 +261,19 @@ pub fn readNewick(allocator: Allocator, input: []const u8) !Tree {
                 current_node = null;
             },
             ',' => {
-                // current_node was the left child of the top-of-stack internal node
+                // Attach current_node as a child of the top-of-stack internal node
                 if (current_node) |cn| {
                     if (stack.items.len > 0) {
                         const parent_node = stack.items[stack.items.len - 1];
                         if (left_arr[parent_node] < 0) {
                             left_arr[parent_node] = @intCast(cn);
                             parent[cn] = @intCast(parent_node);
+                        } else if (right_arr[parent_node] < 0) {
+                            right_arr[parent_node] = @intCast(cn);
+                            parent[cn] = @intCast(parent_node);
+                        } else {
+                            // Multifurcation: more than 2 children
+                            return error.MultifurcationNotSupported;
                         }
                     }
                 }
@@ -278,12 +284,14 @@ pub fn readNewick(allocator: Allocator, input: []const u8) !Tree {
                 if (stack.items.len == 0) return error.InvalidInput;
                 const internal_node = stack.pop().?;
 
-                // Attach current_node as right child
+                // Attach current_node as child
                 if (current_node) |cn| {
                     if (left_arr[internal_node] < 0) {
                         left_arr[internal_node] = @intCast(cn);
-                    } else {
+                    } else if (right_arr[internal_node] < 0) {
                         right_arr[internal_node] = @intCast(cn);
+                    } else {
+                        return error.MultifurcationNotSupported;
                     }
                     parent[cn] = @intCast(internal_node);
                 }
