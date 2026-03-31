@@ -160,6 +160,94 @@ pub const Sequence = struct {
         };
     }
 
+    // --- Metadata setters ---
+
+    pub fn setName(self: *Sequence, s: []const u8) !void {
+        const new_name = try self.allocator.dupe(u8, s);
+        self.allocator.free(self.name);
+        self.name = new_name;
+    }
+
+    pub fn setAccession(self: *Sequence, s: []const u8) !void {
+        if (self.accession) |old| self.allocator.free(old);
+        self.accession = try self.allocator.dupe(u8, s);
+    }
+
+    pub fn setDescription(self: *Sequence, s: []const u8) !void {
+        if (self.description) |old| self.allocator.free(old);
+        self.description = try self.allocator.dupe(u8, s);
+    }
+
+    pub fn setSource(self: *Sequence, name: []const u8, start: i64, end: i64, full_length: i64) !void {
+        if (self.source) |old| self.allocator.free(old.name);
+        const src_name = try self.allocator.dupe(u8, name);
+        self.source = Source{
+            .name = src_name,
+            .start = start,
+            .end = end,
+            .full_length = full_length,
+        };
+    }
+
+    // --- Utilities ---
+
+    /// Compute a CRC32 checksum of the digital sequence data.
+    pub fn crcChecksum(self: Sequence) u32 {
+        var val: u32 = 0;
+        for (self.dsq) |code| {
+            val = val *% 31 +% @as(u32, code);
+        }
+        return val;
+    }
+
+    /// Count residue frequencies. Returns array of length abc.kp.
+    /// Caller owns the returned slice.
+    pub fn countResidues(self: Sequence) ![]f64 {
+        const kp: usize = @intCast(self.abc.kp);
+        const counts = try self.allocator.alloc(f64, kp);
+        @memset(counts, 0.0);
+        for (self.dsq) |code| {
+            if (code < kp) {
+                counts[code] += 1.0;
+            }
+        }
+        return counts;
+    }
+
+    /// Convert all degenerate residue codes to the unknown symbol (X/N).
+    /// Modifies the sequence in place.
+    pub fn convertDegen2X(self: *Sequence) void {
+        const unknown = self.abc.unknownCode();
+        for (self.dsq) |*code| {
+            if (self.abc.isDegenerate(code.*)) {
+                code.* = unknown;
+            }
+        }
+    }
+
+    /// Guess the alphabet type from the sequence content.
+    pub fn guessAlphabet(self: Sequence) ?alphabet_mod.AlphabetType {
+        const text = self.abc.textize(self.allocator, self.dsq) catch return null;
+        defer self.allocator.free(text);
+        return alphabet_mod.guessType(text);
+    }
+
+    /// Compare two sequences for equality (name and digital sequence data).
+    pub fn eql(self: Sequence, other: Sequence) bool {
+        if (!std.mem.eql(u8, self.name, other.name)) return false;
+        if (!std.mem.eql(u8, self.dsq, other.dsq)) return false;
+        return true;
+    }
+
+    /// Validate internal consistency.
+    pub fn isValid(self: Sequence) bool {
+        if (self.name.len == 0) return false;
+        for (self.dsq) |code| {
+            if (code >= self.abc.kp) return false;
+        }
+        return true;
+    }
+
     /// Free all owned memory.
     pub fn deinit(self: *Sequence) void {
         self.allocator.free(self.name);
@@ -168,6 +256,59 @@ pub const Sequence = struct {
         if (self.description) |desc| self.allocator.free(desc);
         if (self.secondary_structure) |ss| self.allocator.free(ss);
         if (self.source) |src| self.allocator.free(src.name);
+    }
+};
+
+/// A block of sequences for batch processing in threaded pipelines.
+/// Sequences are read in blocks and handed to worker threads.
+pub const SequenceBlock = struct {
+    seqs: []Sequence,
+    count: usize, // Number of valid sequences (may be less than seqs.len for last block)
+    allocator: Allocator,
+
+    /// Create a block with pre-allocated capacity.
+    pub fn initCapacity(allocator: Allocator, capacity: usize) !SequenceBlock {
+        const seqs = try allocator.alloc(Sequence, capacity);
+        return SequenceBlock{
+            .seqs = seqs,
+            .count = 0,
+            .allocator = allocator,
+        };
+    }
+
+    /// Add a sequence to the block. Takes ownership of the sequence.
+    pub fn add(self: *SequenceBlock, seq: Sequence) !void {
+        if (self.count >= self.seqs.len) {
+            // Grow the block
+            const new_cap = if (self.seqs.len == 0) 8 else self.seqs.len * 2;
+            const new_seqs = try self.allocator.alloc(Sequence, new_cap);
+            @memcpy(new_seqs[0..self.count], self.seqs[0..self.count]);
+            self.allocator.free(self.seqs);
+            self.seqs = new_seqs;
+        }
+        self.seqs[self.count] = seq;
+        self.count += 1;
+    }
+
+    /// Reset the block for reuse, freeing all contained sequences.
+    pub fn reset(self: *SequenceBlock) void {
+        for (0..self.count) |i| {
+            self.seqs[i].deinit();
+        }
+        self.count = 0;
+    }
+
+    /// Get the valid sequences in this block.
+    pub fn items(self: SequenceBlock) []Sequence {
+        return self.seqs[0..self.count];
+    }
+
+    /// Free the block and all contained sequences.
+    pub fn deinit(self: *SequenceBlock) void {
+        for (0..self.count) |i| {
+            self.seqs[i].deinit();
+        }
+        self.allocator.free(self.seqs);
     }
 };
 
@@ -296,4 +437,165 @@ test "subseq: out of bounds returns error" {
 
     try std.testing.expectError(error.OutOfBounds, seq.subseq(3, 6));
     try std.testing.expectError(error.OutOfBounds, seq.subseq(3, 2));
+}
+
+// --- New tests for added functionality ---
+
+test "setName: replaces name" {
+    const allocator = std.testing.allocator;
+    var seq = try Sequence.fromText(allocator, &alphabet_mod.dna, "old", "ACGT");
+    defer seq.deinit();
+
+    try seq.setName("new_name");
+    try std.testing.expectEqualStrings("new_name", seq.name);
+}
+
+test "setAccession and setDescription" {
+    const allocator = std.testing.allocator;
+    var seq = try Sequence.fromText(allocator, &alphabet_mod.dna, "seq1", "ACGT");
+    defer seq.deinit();
+
+    try seq.setAccession("P12345");
+    try std.testing.expectEqualStrings("P12345", seq.accession.?);
+
+    try seq.setDescription("A test sequence");
+    try std.testing.expectEqualStrings("A test sequence", seq.description.?);
+
+    // Replace existing
+    try seq.setAccession("Q99999");
+    try std.testing.expectEqualStrings("Q99999", seq.accession.?);
+}
+
+test "setSource" {
+    const allocator = std.testing.allocator;
+    var seq = try Sequence.fromText(allocator, &alphabet_mod.dna, "seq1", "ACGT");
+    defer seq.deinit();
+
+    try seq.setSource("chr1", 100, 200, 50000);
+    try std.testing.expectEqualStrings("chr1", seq.source.?.name);
+    try std.testing.expectEqual(@as(i64, 100), seq.source.?.start);
+    try std.testing.expectEqual(@as(i64, 200), seq.source.?.end);
+}
+
+test "crcChecksum: deterministic" {
+    const allocator = std.testing.allocator;
+    var seq = try Sequence.fromText(allocator, &alphabet_mod.dna, "seq1", "ACGT");
+    defer seq.deinit();
+
+    const c1 = seq.crcChecksum();
+    const c2 = seq.crcChecksum();
+    try std.testing.expectEqual(c1, c2);
+}
+
+test "crcChecksum: different sequences differ" {
+    const allocator = std.testing.allocator;
+    var s1 = try Sequence.fromText(allocator, &alphabet_mod.dna, "a", "ACGT");
+    defer s1.deinit();
+    var s2 = try Sequence.fromText(allocator, &alphabet_mod.dna, "b", "TGCA");
+    defer s2.deinit();
+
+    try std.testing.expect(s1.crcChecksum() != s2.crcChecksum());
+}
+
+test "countResidues: AACG -> 2A, 1C, 1G" {
+    const allocator = std.testing.allocator;
+    var seq = try Sequence.fromText(allocator, &alphabet_mod.dna, "seq1", "AACG");
+    defer seq.deinit();
+
+    const counts = try seq.countResidues();
+    defer allocator.free(counts);
+
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), counts[0], 1e-9); // A
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), counts[1], 1e-9); // C
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), counts[2], 1e-9); // G
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), counts[3], 1e-9); // T
+}
+
+test "convertDegen2X: R becomes N" {
+    const allocator = std.testing.allocator;
+    var seq = try Sequence.fromText(allocator, &alphabet_mod.dna, "seq1", "ACRG");
+    defer seq.deinit();
+
+    seq.convertDegen2X();
+
+    const text = try seq.toText();
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("ACNG", text);
+}
+
+test "eql: identical sequences" {
+    const allocator = std.testing.allocator;
+    var s1 = try Sequence.fromText(allocator, &alphabet_mod.dna, "seq1", "ACGT");
+    defer s1.deinit();
+    var s2 = try Sequence.fromText(allocator, &alphabet_mod.dna, "seq1", "ACGT");
+    defer s2.deinit();
+
+    try std.testing.expect(s1.eql(s2));
+}
+
+test "eql: different sequences" {
+    const allocator = std.testing.allocator;
+    var s1 = try Sequence.fromText(allocator, &alphabet_mod.dna, "seq1", "ACGT");
+    defer s1.deinit();
+    var s2 = try Sequence.fromText(allocator, &alphabet_mod.dna, "seq2", "ACGT");
+    defer s2.deinit();
+
+    try std.testing.expect(!s1.eql(s2));
+}
+
+test "isValid: valid sequence" {
+    const allocator = std.testing.allocator;
+    var seq = try Sequence.fromText(allocator, &alphabet_mod.dna, "seq1", "ACGT");
+    defer seq.deinit();
+
+    try std.testing.expect(seq.isValid());
+}
+
+test "SequenceBlock: basic add and iterate" {
+    const allocator = std.testing.allocator;
+    var block = try SequenceBlock.initCapacity(allocator, 4);
+    defer block.deinit();
+
+    const s1 = try Sequence.fromText(allocator, &alphabet_mod.dna, "s1", "ACGT");
+    try block.add(s1);
+    const s2 = try Sequence.fromText(allocator, &alphabet_mod.dna, "s2", "TGCA");
+    try block.add(s2);
+
+    try std.testing.expectEqual(@as(usize, 2), block.count);
+    try std.testing.expectEqualStrings("s1", block.items()[0].name);
+    try std.testing.expectEqualStrings("s2", block.items()[1].name);
+}
+
+test "SequenceBlock: reset and reuse" {
+    const allocator = std.testing.allocator;
+    var block = try SequenceBlock.initCapacity(allocator, 4);
+    defer block.deinit();
+
+    const s1 = try Sequence.fromText(allocator, &alphabet_mod.dna, "s1", "ACGT");
+    try block.add(s1);
+    try std.testing.expectEqual(@as(usize, 1), block.count);
+
+    block.reset();
+    try std.testing.expectEqual(@as(usize, 0), block.count);
+
+    // Reuse
+    const s2 = try Sequence.fromText(allocator, &alphabet_mod.dna, "s2", "TGCA");
+    try block.add(s2);
+    try std.testing.expectEqual(@as(usize, 1), block.count);
+    try std.testing.expectEqualStrings("s2", block.items()[0].name);
+}
+
+test "SequenceBlock: auto-grow beyond initial capacity" {
+    const allocator = std.testing.allocator;
+    var block = try SequenceBlock.initCapacity(allocator, 2);
+    defer block.deinit();
+
+    for (0..5) |i| {
+        var buf: [8]u8 = undefined;
+        const name = std.fmt.bufPrint(&buf, "s{d}", .{i}) catch unreachable;
+        const seq = try Sequence.fromText(allocator, &alphabet_mod.dna, name, "ACGT");
+        try block.add(seq);
+    }
+
+    try std.testing.expectEqual(@as(usize, 5), block.count);
 }
