@@ -22,6 +22,12 @@ pub const graph = @import("graph.zig");
 pub const cpu = @import("cpu.zig");
 pub const ratematrix = @import("ratematrix.zig");
 pub const threads = @import("threads.zig");
+pub const red_black = @import("red_black.zig");
+pub const huffman = @import("huffman.zig");
+pub const paml = @import("paml.zig");
+pub const mixdchlet = @import("mixdchlet.zig");
+pub const iset = @import("iset.zig");
+pub const recorder = @import("recorder.zig");
 
 // Include tests from all sub-modules in `zig build test`.
 test {
@@ -49,4 +55,10 @@ test {
     _ = cpu;
     _ = ratematrix;
     _ = threads;
+    _ = red_black;
+    _ = huffman;
+    _ = paml;
+    _ = mixdchlet;
+    _ = iset;
+    _ = recorder;
 }
