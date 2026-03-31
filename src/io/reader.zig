@@ -4,6 +4,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Alphabet = @import("../alphabet.zig").Alphabet;
 const Sequence = @import("../sequence.zig").Sequence;
+const SsiIndex = @import("../ssi.zig").SsiIndex;
 const fasta = @import("fasta.zig");
 const stockholm = @import("stockholm.zig");
 const genbank = @import("genbank.zig");
@@ -99,6 +100,8 @@ pub const Reader = struct {
     // Clustal/AFA buffering: sequences extracted from the MSA on first call.
     msa_seqs: ?[]Sequence = null,
     msa_idx: usize = 0,
+    // Optional SSI index for random access by name.
+    ssi_index: ?SsiIndex = null,
 
     /// Open a file and create a reader (reads entire file into memory).
     /// If format is null, the format is auto-detected from the file header.
@@ -134,6 +137,115 @@ pub const Reader = struct {
             .allocator = allocator,
             .owns_data = false,
         };
+    }
+
+    /// Open a file and create a reader, also loading a `.ssi` index if present.
+    /// The index file is looked up at `<path>.ssi`. If the index file does not
+    /// exist, the reader is created without an index (fetch/fetchSubseq will
+    /// return error.NoIndex).
+    pub fn openWithIndex(allocator: Allocator, abc: *const Alphabet, path: []const u8, format: ?Format) !Reader {
+        var reader = try fromFile(allocator, abc, path, format);
+        errdefer reader.deinit();
+
+        // Try to load "<path>.ssi"
+        const ssi_path = try std.fmt.allocPrint(allocator, "{s}.ssi", .{path});
+        defer allocator.free(ssi_path);
+
+        const ssi_file = std.fs.cwd().openFile(ssi_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return reader,
+            else => return err,
+        };
+        defer ssi_file.close();
+
+        const ssi_data = try ssi_file.readToEndAlloc(allocator, std.math.maxInt(usize));
+        defer allocator.free(ssi_data);
+
+        var stream = std.io.fixedBufferStream(ssi_data);
+        var ssi_index = try SsiIndex.read(allocator, stream.reader().any());
+        errdefer ssi_index.deinit();
+
+        reader.ssi_index = ssi_index;
+        return reader;
+    }
+
+    /// Fetch a sequence by name/accession using the SSI index.
+    /// Seeks to the byte offset recorded in the index and parses that single
+    /// record from the in-memory data buffer.
+    /// Returns null if the key is not found in the index.
+    /// Returns error.NoIndex if no SSI index is loaded.
+    pub fn fetch(self: *Reader, key: []const u8) !?Sequence {
+        const index = self.ssi_index orelse return error.NoIndex;
+        const entry = index.lookup(key) orelse return null;
+        const offset = entry.offset;
+        if (offset >= self.data.len) return error.InvalidOffset;
+
+        var pos = @as(usize, @intCast(offset));
+        return try fasta.parseOne(self.allocator, self.abc, self.data, &pos);
+    }
+
+    /// Fetch a subsequence by name and coordinate range (1-indexed, inclusive).
+    /// Uses the SSI index to locate the sequence, parses it, then extracts the
+    /// requested region. If start > end (for nucleotide sequences), the result
+    /// is reverse-complemented.
+    /// Returns null if the key is not found in the index.
+    /// Returns error.NoIndex if no SSI index is loaded.
+    pub fn fetchSubseq(self: *Reader, key: []const u8, start: i64, end: i64) !?Sequence {
+        var full_seq = try self.fetch(key) orelse return null;
+        errdefer full_seq.deinit();
+
+        // Determine direction and normalised 1-based coords.
+        const reverse = start > end;
+        const lo: usize = if (reverse) @intCast(end) else @intCast(start);
+        const hi: usize = if (reverse) @intCast(start) else @intCast(end);
+
+        if (lo == 0 or hi == 0) return error.InvalidCoordinate;
+        if (hi > full_seq.dsq.len) return error.InvalidCoordinate;
+
+        // Extract the subsequence (1-indexed inclusive -> 0-indexed slice).
+        const sub_dsq = try self.allocator.dupe(u8, full_seq.dsq[lo - 1 .. hi]);
+        errdefer self.allocator.free(sub_dsq);
+
+        const name_copy = try self.allocator.dupe(u8, full_seq.name);
+        errdefer self.allocator.free(name_copy);
+
+        var desc_copy: ?[]const u8 = null;
+        if (full_seq.description) |desc| {
+            desc_copy = try self.allocator.dupe(u8, desc);
+        }
+        errdefer if (desc_copy) |d| self.allocator.free(d);
+
+        // Source.name must be a separate allocation since Sequence.deinit
+        // frees both .name and .source.name independently.
+        const source_name = try self.allocator.dupe(u8, full_seq.name);
+        errdefer self.allocator.free(source_name);
+
+        const full_length: i64 = @intCast(full_seq.dsq.len);
+
+        var sub_seq = Sequence{
+            .name = name_copy,
+            .accession = null,
+            .description = desc_copy,
+            .taxonomy_id = null,
+            .dsq = sub_dsq,
+            .secondary_structure = null,
+            .source = Sequence.Source{
+                .name = source_name,
+                .start = start,
+                .end = end,
+                .full_length = full_length,
+            },
+            .abc = self.abc,
+            .allocator = self.allocator,
+        };
+
+        // Free the full sequence; we have already extracted what we need.
+        full_seq.deinit();
+
+        if (reverse) {
+            try sub_seq.reverseComplement();
+        }
+
+        return sub_seq;
     }
 
     /// Read the next sequence record. Returns null at EOF.
@@ -318,6 +430,9 @@ pub const Reader = struct {
         if (self.msa_seqs) |seqs| {
             for (seqs[self.msa_idx..]) |*s| @constCast(s).deinit();
             self.allocator.free(seqs);
+        }
+        if (self.ssi_index) |*idx| {
+            idx.deinit();
         }
         if (self.owns_data) {
             self.allocator.free(self.data);
@@ -633,4 +748,192 @@ test "Reader.next: pfam format reads as stockholm" {
 
     const eof = try reader.next();
     try std.testing.expectEqual(@as(?Sequence, null), eof);
+}
+
+// --- SSI integration tests ---
+
+test "Reader.fetch: returns error.NoIndex when no index loaded" {
+    const allocator = std.testing.allocator;
+    const data = ">seq1\nACGT\n";
+
+    var reader = try Reader.fromMemory(allocator, &alphabet_mod.dna, data, .fasta);
+    defer reader.deinit();
+
+    try std.testing.expectError(error.NoIndex, reader.fetch("seq1"));
+}
+
+test "Reader.fetch: retrieves sequence by name via SSI index" {
+    const allocator = std.testing.allocator;
+    const data = ">seq1\nACGT\n>seq2\nGGGG\n>seq3\nTTTT\n";
+
+    var reader = try Reader.fromMemory(allocator, &alphabet_mod.dna, data, .fasta);
+    defer reader.deinit();
+
+    // Build an SSI index from the same data and attach it.
+    reader.ssi_index = try SsiIndex.buildFromFasta(allocator, data);
+
+    // Fetch seq2 directly (skipping seq1).
+    var seq2 = (try reader.fetch("seq2")) orelse return error.ExpectedSequence;
+    defer seq2.deinit();
+    try std.testing.expectEqualStrings("seq2", seq2.name);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 2, 2, 2, 2 }, seq2.dsq);
+
+    // Fetch seq1.
+    var seq1 = (try reader.fetch("seq1")) orelse return error.ExpectedSequence;
+    defer seq1.deinit();
+    try std.testing.expectEqualStrings("seq1", seq1.name);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 2, 3 }, seq1.dsq);
+}
+
+test "Reader.fetch: returns null for unknown key" {
+    const allocator = std.testing.allocator;
+    const data = ">seq1\nACGT\n";
+
+    var reader = try Reader.fromMemory(allocator, &alphabet_mod.dna, data, .fasta);
+    defer reader.deinit();
+    reader.ssi_index = try SsiIndex.buildFromFasta(allocator, data);
+
+    const result = try reader.fetch("nonexistent");
+    try std.testing.expectEqual(@as(?Sequence, null), result);
+}
+
+test "Reader.fetchSubseq: extracts subsequence by coordinates" {
+    const allocator = std.testing.allocator;
+    const data = ">seq1\nACGTACGT\n";
+
+    var reader = try Reader.fromMemory(allocator, &alphabet_mod.dna, data, .fasta);
+    defer reader.deinit();
+    reader.ssi_index = try SsiIndex.buildFromFasta(allocator, data);
+
+    // Fetch positions 3-6 (1-indexed inclusive): GTAC
+    var sub = (try reader.fetchSubseq("seq1", 3, 6)) orelse return error.ExpectedSequence;
+    defer sub.deinit();
+    try std.testing.expectEqualStrings("seq1", sub.name);
+    // G=2, T=3, A=0, C=1
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 2, 3, 0, 1 }, sub.dsq);
+    try std.testing.expectEqual(@as(usize, 4), sub.dsq.len);
+
+    // Verify source annotation.
+    const src = sub.source orelse return error.ExpectedSource;
+    try std.testing.expectEqual(@as(i64, 3), src.start);
+    try std.testing.expectEqual(@as(i64, 6), src.end);
+    try std.testing.expectEqual(@as(i64, 8), src.full_length);
+}
+
+test "Reader.fetchSubseq: reverse complement when start > end" {
+    const allocator = std.testing.allocator;
+    // ACGT = A(0) C(1) G(2) T(3)
+    const data = ">seq1\nACGT\n";
+
+    var reader = try Reader.fromMemory(allocator, &alphabet_mod.dna, data, .fasta);
+    defer reader.deinit();
+    reader.ssi_index = try SsiIndex.buildFromFasta(allocator, data);
+
+    // start=3, end=2 means reverse complement of positions 2..3
+    // Forward region [2..3] (1-indexed) of ACGT = C(1),G(2)
+    // Reverse: G(2),C(1); complement: C(1),G(2) => [1, 2]
+    var sub = (try reader.fetchSubseq("seq1", 3, 2)) orelse return error.ExpectedSequence;
+    defer sub.deinit();
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2 }, sub.dsq);
+}
+
+test "Reader.fetchSubseq: returns null for unknown key" {
+    const allocator = std.testing.allocator;
+    const data = ">seq1\nACGT\n";
+
+    var reader = try Reader.fromMemory(allocator, &alphabet_mod.dna, data, .fasta);
+    defer reader.deinit();
+    reader.ssi_index = try SsiIndex.buildFromFasta(allocator, data);
+
+    const result = try reader.fetchSubseq("nonexistent", 1, 2);
+    try std.testing.expectEqual(@as(?Sequence, null), result);
+}
+
+test "Reader.fetchSubseq: returns error for out-of-range coordinates" {
+    const allocator = std.testing.allocator;
+    const data = ">seq1\nACGT\n";
+
+    var reader = try Reader.fromMemory(allocator, &alphabet_mod.dna, data, .fasta);
+    defer reader.deinit();
+    reader.ssi_index = try SsiIndex.buildFromFasta(allocator, data);
+
+    try std.testing.expectError(error.InvalidCoordinate, reader.fetchSubseq("seq1", 1, 10));
+    try std.testing.expectError(error.InvalidCoordinate, reader.fetchSubseq("seq1", 0, 2));
+}
+
+test "Reader.fetchSubseq: returns error.NoIndex without index" {
+    const allocator = std.testing.allocator;
+    const data = ">seq1\nACGT\n";
+
+    var reader = try Reader.fromMemory(allocator, &alphabet_mod.dna, data, .fasta);
+    defer reader.deinit();
+
+    try std.testing.expectError(error.NoIndex, reader.fetchSubseq("seq1", 1, 4));
+}
+
+test "Reader.openWithIndex: loads ssi file when present" {
+    const allocator = std.testing.allocator;
+    const fasta_data = ">alpha\nACGT\n>beta\nGGGG\n";
+
+    // Write a temporary FASTA file and its SSI index.
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.fasta", .data = fasta_data });
+
+    // Build an index from the FASTA data and write it to a buffer.
+    var idx = try SsiIndex.buildFromFasta(allocator, fasta_data);
+    defer idx.deinit();
+
+    var ssi_buf = std.ArrayList(u8){};
+    defer ssi_buf.deinit(allocator);
+    try idx.write(ssi_buf.writer(allocator).any());
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.fasta.ssi", .data = ssi_buf.items });
+
+    // Now open with index using the full path.
+    const dir_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+
+    const full_path = try std.fmt.allocPrint(allocator, "{s}/test.fasta", .{dir_path});
+    defer allocator.free(full_path);
+
+    var reader = try Reader.openWithIndex(allocator, &alphabet_mod.dna, full_path, .fasta);
+    defer reader.deinit();
+
+    // SSI index should be loaded.
+    try std.testing.expect(reader.ssi_index != null);
+
+    // Fetch by name should work.
+    var seq = (try reader.fetch("beta")) orelse return error.ExpectedSequence;
+    defer seq.deinit();
+    try std.testing.expectEqualStrings("beta", seq.name);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 2, 2, 2, 2 }, seq.dsq);
+}
+
+test "Reader.openWithIndex: works without ssi file" {
+    const allocator = std.testing.allocator;
+    const fasta_data = ">alpha\nACGT\n";
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.fasta", .data = fasta_data });
+
+    const dir_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+
+    const full_path = try std.fmt.allocPrint(allocator, "{s}/test.fasta", .{dir_path});
+    defer allocator.free(full_path);
+
+    var reader = try Reader.openWithIndex(allocator, &alphabet_mod.dna, full_path, .fasta);
+    defer reader.deinit();
+
+    // No SSI index.
+    try std.testing.expect(reader.ssi_index == null);
+
+    // Sequential reading still works.
+    var seq = (try reader.next()) orelse return error.ExpectedSequence;
+    defer seq.deinit();
+    try std.testing.expectEqualStrings("alpha", seq.name);
 }
