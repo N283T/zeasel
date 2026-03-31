@@ -23,11 +23,14 @@ pub const SsiEntry = struct {
     offset: u64,
     data_offset: u64,
     seq_len: u64,
+    file_id: u16 = 0, // Index into file_names array for multi-file support
 };
 
 pub const SsiIndex = struct {
     entries: []SsiEntry,
     name_map: std.StringHashMap(usize),
+    alias_map: std.StringHashMap(usize), // Secondary key -> primary entry index
+    file_names: [][]const u8, // Multi-file support: file_names[file_id]
     allocator: Allocator,
 
     /// Build an index from a FASTA byte buffer.
@@ -111,14 +114,61 @@ pub const SsiIndex = struct {
         return SsiIndex{
             .entries = entries,
             .name_map = name_map,
+            .alias_map = std.StringHashMap(usize).init(allocator),
+            .file_names = &.{},
             .allocator = allocator,
         };
     }
 
-    /// Look up a sequence by name. Returns the entry or null if not found.
+    /// Look up a sequence by primary name or alias. Returns the entry or null.
     pub fn lookup(self: SsiIndex, name: []const u8) ?SsiEntry {
-        const idx = self.name_map.get(name) orelse return null;
+        const idx = self.name_map.get(name) orelse
+            self.alias_map.get(name) orelse return null;
         return self.entries[idx];
+    }
+
+    /// Look up a sequence by ordinal number (0-indexed).
+    pub fn findNumber(self: SsiIndex, number: usize) ?SsiEntry {
+        if (number >= self.entries.len) return null;
+        return self.entries[number];
+    }
+
+    /// Add an alias (secondary key) mapping to an existing primary entry.
+    pub fn addAlias(self: *SsiIndex, alias: []const u8, primary_name: []const u8) !void {
+        const idx = self.name_map.get(primary_name) orelse return error.KeyNotFound;
+        const alias_copy = try self.allocator.dupe(u8, alias);
+        errdefer self.allocator.free(alias_copy);
+        try self.alias_map.put(alias_copy, idx);
+    }
+
+    /// Add a file to the multi-file index. Returns the file_id.
+    pub fn addFile(self: *SsiIndex, file_name: []const u8) !u16 {
+        const new_id: u16 = @intCast(self.file_names.len);
+        const name_copy = try self.allocator.dupe(u8, file_name);
+        errdefer self.allocator.free(name_copy);
+
+        const new_list = try self.allocator.alloc([]const u8, self.file_names.len + 1);
+        @memcpy(new_list[0..self.file_names.len], self.file_names);
+        new_list[self.file_names.len] = name_copy;
+        if (self.file_names.len > 0) self.allocator.free(self.file_names);
+        self.file_names = new_list;
+
+        return new_id;
+    }
+
+    /// Get the file name for a given file_id.
+    pub fn fileInfo(self: SsiIndex, file_id: u16) ?[]const u8 {
+        if (file_id >= self.file_names.len) return null;
+        return self.file_names[file_id];
+    }
+
+    /// Compute subsequence position: given a sequence name, start, and end
+    /// residue coordinates (1-indexed), returns the entry with positioning info.
+    /// The caller can use data_offset + computed byte offset for seeking.
+    pub fn findSubseq(self: SsiIndex, name: []const u8, start: u64, end: u64) ?struct { entry: SsiEntry, start: u64, end: u64 } {
+        const entry = self.lookup(name) orelse return null;
+        if (start == 0 or end == 0 or start > entry.seq_len or end > entry.seq_len) return null;
+        return .{ .entry = entry, .start = start, .end = end };
     }
 
     /// Write the index to a binary stream (little-endian).
@@ -185,6 +235,8 @@ pub const SsiIndex = struct {
         return SsiIndex{
             .entries = entries,
             .name_map = name_map,
+            .alias_map = std.StringHashMap(usize).init(allocator),
+            .file_names = &.{},
             .allocator = allocator,
         };
     }
@@ -193,6 +245,12 @@ pub const SsiIndex = struct {
         for (self.entries) |e| self.allocator.free(e.name);
         self.allocator.free(self.entries);
         self.name_map.deinit();
+        // Free alias keys (they were duped)
+        var alias_it = self.alias_map.keyIterator();
+        while (alias_it.next()) |key| self.allocator.free(key.*);
+        self.alias_map.deinit();
+        for (self.file_names) |f| self.allocator.free(f);
+        if (self.file_names.len > 0) self.allocator.free(self.file_names);
     }
 };
 
@@ -282,6 +340,85 @@ test "buildFromFasta: multi-line sequences" {
 
     try std.testing.expectEqual(@as(u64, 8), idx.entries[0].seq_len);
     try std.testing.expectEqual(@as(u64, 2), idx.entries[1].seq_len);
+}
+
+test "addAlias: lookup by alias" {
+    const allocator = std.testing.allocator;
+    const data = ">seq1\nACGT\n>seq2\nGGGG\n";
+
+    var idx = try SsiIndex.buildFromFasta(allocator, data);
+    defer idx.deinit();
+
+    try idx.addAlias("alias1", "seq1");
+    const e = idx.lookup("alias1") orelse return error.TestEntryNotFound;
+    try std.testing.expectEqualStrings("seq1", e.name);
+    try std.testing.expectEqual(@as(u64, 4), e.seq_len);
+}
+
+test "addAlias: unknown primary returns error" {
+    const allocator = std.testing.allocator;
+    const data = ">seq1\nACGT\n";
+
+    var idx = try SsiIndex.buildFromFasta(allocator, data);
+    defer idx.deinit();
+
+    try std.testing.expectError(error.KeyNotFound, idx.addAlias("alias1", "nonexistent"));
+}
+
+test "findNumber: ordinal lookup" {
+    const allocator = std.testing.allocator;
+    const data = ">seq1\nACGT\n>seq2\nGGGG\n";
+
+    var idx = try SsiIndex.buildFromFasta(allocator, data);
+    defer idx.deinit();
+
+    const e0 = idx.findNumber(0) orelse return error.TestEntryNotFound;
+    try std.testing.expectEqualStrings("seq1", e0.name);
+
+    const e1 = idx.findNumber(1) orelse return error.TestEntryNotFound;
+    try std.testing.expectEqualStrings("seq2", e1.name);
+
+    try std.testing.expect(idx.findNumber(2) == null);
+}
+
+test "addFile and fileInfo" {
+    const allocator = std.testing.allocator;
+    const data = ">seq1\nACGT\n";
+
+    var idx = try SsiIndex.buildFromFasta(allocator, data);
+    defer idx.deinit();
+
+    const id0 = try idx.addFile("data/file1.fasta");
+    const id1 = try idx.addFile("data/file2.fasta");
+
+    try std.testing.expectEqual(@as(u16, 0), id0);
+    try std.testing.expectEqual(@as(u16, 1), id1);
+    try std.testing.expectEqualStrings("data/file1.fasta", idx.fileInfo(0).?);
+    try std.testing.expectEqualStrings("data/file2.fasta", idx.fileInfo(1).?);
+    try std.testing.expect(idx.fileInfo(2) == null);
+}
+
+test "findSubseq: valid range" {
+    const allocator = std.testing.allocator;
+    const data = ">seq1\nACGTACGT\n";
+
+    var idx = try SsiIndex.buildFromFasta(allocator, data);
+    defer idx.deinit();
+
+    const result = idx.findSubseq("seq1", 3, 6) orelse return error.TestEntryNotFound;
+    try std.testing.expectEqual(@as(u64, 3), result.start);
+    try std.testing.expectEqual(@as(u64, 6), result.end);
+}
+
+test "findSubseq: out of range returns null" {
+    const allocator = std.testing.allocator;
+    const data = ">seq1\nACGT\n";
+
+    var idx = try SsiIndex.buildFromFasta(allocator, data);
+    defer idx.deinit();
+
+    try std.testing.expect(idx.findSubseq("seq1", 1, 10) == null);
+    try std.testing.expect(idx.findSubseq("seq1", 0, 2) == null); // 0 is invalid (1-indexed)
 }
 
 test "buildFromFasta: sequence with description" {
