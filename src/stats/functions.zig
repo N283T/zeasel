@@ -6,6 +6,7 @@
 const std = @import("std");
 const math = std.math;
 const gamma_mod = @import("gamma.zig");
+const c_math = @cImport(@cInclude("math.h"));
 
 /// Compute log(Gamma(x)) for x > 0.
 /// Uses Lanczos approximation with 11 coefficients.
@@ -90,13 +91,9 @@ pub fn trigamma(x_in: f64) f64 {
 }
 
 /// Complementary error function erfc(x) = 1 - erf(x).
-/// Uses Abramowitz and Stegun approximation 7.1.26, max error < 1.5e-7.
+/// Uses C standard library for full double precision (~15 digits).
 pub fn erfc(x: f64) f64 {
-    const ax = @abs(x);
-    const t = 1.0 / (1.0 + 0.3275911 * ax);
-    const poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
-    const result = poly * @exp(-ax * ax);
-    return if (x >= 0) result else 2.0 - result;
+    return c_math.erfc(x);
 }
 
 /// Chi-squared test: P(chi^2 > x) with v degrees of freedom.

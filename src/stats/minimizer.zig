@@ -82,13 +82,13 @@ pub fn minimize(
         if (grad_norm_sq < options.tol * options.tol) return f_val;
 
         // Polak-Ribière beta: beta = (g_new^T (g_new - g_old)) / |g_old|^2
-        var dot_new: f64 = 0;
+        var dot_old: f64 = 0;
         var dot_diff: f64 = 0;
         for (0..n) |i| {
-            dot_new += grad[i] * grad[i];
+            dot_old += prev_grad[i] * prev_grad[i];
             dot_diff += grad[i] * (grad[i] - prev_grad[i]);
         }
-        const beta = @max(0.0, dot_diff / dot_new); // Clamp to 0 to reset on bad directions
+        const beta = if (dot_old > 0) @max(0.0, dot_diff / dot_old) else 0.0;
 
         // Update conjugate direction
         for (0..n) |i| direction[i] = -grad[i] + beta * direction[i];
