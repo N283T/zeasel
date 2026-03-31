@@ -5,6 +5,7 @@ pub const gamma = @import("stats/gamma.zig");
 pub const dirichlet = @import("stats/dirichlet.zig");
 pub const minimizer = @import("stats/minimizer.zig");
 pub const rootfinder = @import("stats/rootfinder.zig");
+pub const histogram = @import("stats/histogram.zig");
 
 test {
     _ = gumbel;
@@ -13,4 +14,5 @@ test {
     _ = dirichlet;
     _ = minimizer;
     _ = rootfinder;
+    _ = histogram;
 }
