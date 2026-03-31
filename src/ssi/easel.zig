@@ -9,6 +9,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const ssi = @import("../ssi.zig");
+const SsiEntry = ssi.SsiEntry;
 
 pub const EASEL_MAGIC: u32 = 0xd3d3c9b3;
 pub const EASEL_MAGIC_SWAPPED: u32 = 0xb3c9d3d3;
@@ -171,6 +172,145 @@ pub const EaselIndex = struct {
             .files = files,
             .allocator = allocator,
         };
+    }
+
+    /// Look up a key in the index, trying primary keys first, then secondary.
+    /// Returns an SsiEntry on success (caller owns entry.name) or null if not found.
+    pub fn lookup(self: *EaselIndex, allocator: Allocator, key: []const u8) !?SsiEntry {
+        // Try primary keys first.
+        if (try self.binarySearchPrimary(allocator, key)) |entry| {
+            return entry;
+        }
+
+        // Try secondary keys if present.
+        if (self.nsecondary > 0) {
+            if (try self.binarySearchSecondary(allocator, key)) |primary_key| {
+                defer allocator.free(primary_key);
+
+                // Look up the primary key to get the full entry.
+                if (try self.binarySearchPrimary(allocator, primary_key)) |entry| {
+                    // Replace the primary key name with the search key
+                    // so the caller sees what they asked for.
+                    allocator.free(entry.name);
+                    const name_copy = try allocator.dupe(u8, key);
+                    return SsiEntry{
+                        .name = name_copy,
+                        .offset = entry.offset,
+                        .data_offset = entry.data_offset,
+                        .seq_len = entry.seq_len,
+                        .file_id = entry.file_id,
+                    };
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /// Binary search the primary key section for the given key.
+    /// Returns an SsiEntry (caller owns entry.name) or null.
+    fn binarySearchPrimary(self: *EaselIndex, allocator: Allocator, key: []const u8) !?SsiEntry {
+        if (self.nprimary == 0) return null;
+
+        const endian: std.builtin.Endian = if (self.byteswap) .little else .big;
+        const rec_buf = try allocator.alloc(u8, self.precsize);
+        defer allocator.free(rec_buf);
+
+        var low: u64 = 0;
+        var high: u64 = self.nprimary;
+
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            const offset = self.poffset + @as(u64, self.precsize) * mid;
+
+            const n_read = try self.file.preadAll(rec_buf, offset);
+            if (n_read < self.precsize) return error.InvalidFormat;
+
+            // Extract the null-padded key.
+            const rec_key_bytes = rec_buf[0..self.plen];
+            var rec_key_len: usize = 0;
+            for (rec_key_bytes) |c| {
+                if (c == 0) break;
+                rec_key_len += 1;
+            }
+            const rec_key = rec_key_bytes[0..rec_key_len];
+
+            const order = std.mem.order(u8, rec_key, key);
+            switch (order) {
+                .eq => {
+                    // Parse the rest of the record after the key.
+                    var pos: usize = self.plen;
+                    const fnum = readIntFromBuf(u16, rec_buf[pos..], endian);
+                    pos += 2;
+                    const r_off = readOffsetFromBuf(rec_buf[pos..], self.offsz, endian);
+                    pos += self.offsz;
+                    const d_off = readOffsetFromBuf(rec_buf[pos..], self.offsz, endian);
+                    pos += self.offsz;
+                    const len_raw = readIntFromBuf(i64, rec_buf[pos..], endian);
+                    const seq_len: u64 = if (len_raw < 0) 0 else @intCast(len_raw);
+
+                    const name_copy = try allocator.dupe(u8, key);
+                    return SsiEntry{
+                        .name = name_copy,
+                        .offset = r_off,
+                        .data_offset = d_off,
+                        .seq_len = seq_len,
+                        .file_id = fnum,
+                    };
+                },
+                .lt => low = mid + 1,
+                .gt => high = mid,
+            }
+        }
+
+        return null;
+    }
+
+    /// Binary search the secondary key section for the given key.
+    /// Returns the associated primary key as an owned slice, or null.
+    fn binarySearchSecondary(self: *EaselIndex, allocator: Allocator, key: []const u8) !?[]const u8 {
+        if (self.nsecondary == 0) return null;
+
+        const rec_buf = try allocator.alloc(u8, self.srecsize);
+        defer allocator.free(rec_buf);
+
+        var low: u64 = 0;
+        var high: u64 = self.nsecondary;
+
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            const offset = self.soffset + @as(u64, self.srecsize) * mid;
+
+            const n_read = try self.file.preadAll(rec_buf, offset);
+            if (n_read < self.srecsize) return error.InvalidFormat;
+
+            // Extract the null-padded secondary key.
+            const skey_bytes = rec_buf[0..self.slen];
+            var skey_len: usize = 0;
+            for (skey_bytes) |c| {
+                if (c == 0) break;
+                skey_len += 1;
+            }
+            const skey = skey_bytes[0..skey_len];
+
+            const order = std.mem.order(u8, skey, key);
+            switch (order) {
+                .eq => {
+                    // Extract the null-padded primary key.
+                    const pkey_bytes = rec_buf[self.slen..][0..self.plen];
+                    var pkey_len: usize = 0;
+                    for (pkey_bytes) |c| {
+                        if (c == 0) break;
+                        pkey_len += 1;
+                    }
+                    return try allocator.dupe(u8, pkey_bytes[0..pkey_len]);
+                },
+                .lt => low = mid + 1,
+                .gt => high = mid,
+            }
+        }
+
+        return null;
     }
 
     /// Free all allocated memory and close the file handle.
@@ -387,6 +527,63 @@ test "EaselIndex.read: parses byteswapped header" {
     try std.testing.expectEqual(@as(u32, 80), idx.files[0].rpl);
 }
 
+/// Write a single primary key record to a buffer.
+pub fn writePrimaryKey(
+    buf: *std.ArrayList(u8),
+    allocator: Allocator,
+    opts: struct {
+        key: []const u8,
+        plen: u32 = 32,
+        fnum: u16 = 0,
+        r_off: u64 = 0,
+        d_off: u64 = 0,
+        len: i64 = 0,
+        offsz: u8 = 8,
+        byteswap: bool = false,
+    },
+) !void {
+    const writer = buf.writer(allocator);
+    const endian: std.builtin.Endian = if (opts.byteswap) .little else .big;
+
+    // Write null-padded key.
+    try writer.writeAll(opts.key);
+    const pad_len = opts.plen - @as(u32, @intCast(opts.key.len));
+    for (0..pad_len) |_| try writer.writeByte(0);
+
+    // fnum
+    try writer.writeInt(u16, opts.fnum, endian);
+    // r_off
+    try writeOffset(writer, opts.r_off, opts.offsz, endian);
+    // d_off
+    try writeOffset(writer, opts.d_off, opts.offsz, endian);
+    // len
+    try writer.writeInt(i64, opts.len, endian);
+}
+
+/// Write a single secondary key record to a buffer.
+pub fn writeSecondaryKey(
+    buf: *std.ArrayList(u8),
+    allocator: Allocator,
+    opts: struct {
+        skey: []const u8,
+        pkey: []const u8,
+        slen: u32 = 32,
+        plen: u32 = 32,
+    },
+) !void {
+    const writer = buf.writer(allocator);
+
+    // Write null-padded secondary key.
+    try writer.writeAll(opts.skey);
+    const spad = opts.slen - @as(u32, @intCast(opts.skey.len));
+    for (0..spad) |_| try writer.writeByte(0);
+
+    // Write null-padded primary key.
+    try writer.writeAll(opts.pkey);
+    const ppad = opts.plen - @as(u32, @intCast(opts.pkey.len));
+    for (0..ppad) |_| try writer.writeByte(0);
+}
+
 test "EaselIndex.read: parses header with 4-byte offsets" {
     const allocator = std.testing.allocator;
 
@@ -435,4 +632,133 @@ test "EaselIndex.read: parses header with 4-byte offsets" {
     try std.testing.expectEqual(@as(u32, 2), idx.files[1].format);
     try std.testing.expectEqual(@as(u32, 70), idx.files[1].bpl);
     try std.testing.expectEqual(@as(u32, 55), idx.files[1].rpl);
+}
+
+test "EaselIndex.lookup: finds primary key by binary search" {
+    const allocator = std.testing.allocator;
+
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(allocator);
+
+    try writeEaselHeader(&buf, allocator, .{
+        .nfiles = 1,
+        .nprimary = 3,
+        .nsecondary = 0,
+        .plen = 32,
+        .slen = 32,
+        .offsz = 8,
+        .file_names = &.{"test.fa"},
+    });
+
+    // Write 3 sorted primary keys: alpha, beta, gamma.
+    try writePrimaryKey(&buf, allocator, .{ .key = "alpha", .fnum = 0, .r_off = 100, .d_off = 110, .len = 50 });
+    try writePrimaryKey(&buf, allocator, .{ .key = "beta", .fnum = 0, .r_off = 200, .d_off = 220, .len = 75 });
+    try writePrimaryKey(&buf, allocator, .{ .key = "gamma", .fnum = 0, .r_off = 300, .d_off = 330, .len = 120 });
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "prim.ssi", .data = buf.items });
+    const file = try tmp_dir.dir.openFile("prim.ssi", .{});
+
+    var idx = try EaselIndex.read(allocator, file);
+    defer idx.deinit();
+
+    // Find "alpha".
+    {
+        const entry = (try idx.lookup(allocator, "alpha")).?;
+        defer allocator.free(entry.name);
+        try std.testing.expectEqualStrings("alpha", entry.name);
+        try std.testing.expectEqual(@as(u64, 100), entry.offset);
+        try std.testing.expectEqual(@as(u64, 110), entry.data_offset);
+        try std.testing.expectEqual(@as(u64, 50), entry.seq_len);
+        try std.testing.expectEqual(@as(u16, 0), entry.file_id);
+    }
+
+    // Find "beta".
+    {
+        const entry = (try idx.lookup(allocator, "beta")).?;
+        defer allocator.free(entry.name);
+        try std.testing.expectEqualStrings("beta", entry.name);
+        try std.testing.expectEqual(@as(u64, 200), entry.offset);
+        try std.testing.expectEqual(@as(u64, 220), entry.data_offset);
+        try std.testing.expectEqual(@as(u64, 75), entry.seq_len);
+    }
+
+    // Find "gamma".
+    {
+        const entry = (try idx.lookup(allocator, "gamma")).?;
+        defer allocator.free(entry.name);
+        try std.testing.expectEqualStrings("gamma", entry.name);
+        try std.testing.expectEqual(@as(u64, 300), entry.offset);
+        try std.testing.expectEqual(@as(u64, 330), entry.data_offset);
+        try std.testing.expectEqual(@as(u64, 120), entry.seq_len);
+    }
+
+    // Missing key returns null.
+    {
+        const result = try idx.lookup(allocator, "delta");
+        try std.testing.expect(result == null);
+    }
+}
+
+test "EaselIndex.lookup: finds secondary key and resolves to primary" {
+    const allocator = std.testing.allocator;
+
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(allocator);
+
+    try writeEaselHeader(&buf, allocator, .{
+        .nfiles = 1,
+        .nprimary = 2,
+        .nsecondary = 2,
+        .plen = 32,
+        .slen = 32,
+        .offsz = 8,
+        .file_names = &.{"test.fa"},
+    });
+
+    // Write 2 sorted primary keys.
+    try writePrimaryKey(&buf, allocator, .{ .key = "seq1", .fnum = 0, .r_off = 100, .d_off = 110, .len = 50 });
+    try writePrimaryKey(&buf, allocator, .{ .key = "seq2", .fnum = 0, .r_off = 200, .d_off = 220, .len = 75 });
+
+    // Write 2 sorted secondary keys: acc1 -> seq1, acc2 -> seq2.
+    try writeSecondaryKey(&buf, allocator, .{ .skey = "acc1", .pkey = "seq1" });
+    try writeSecondaryKey(&buf, allocator, .{ .skey = "acc2", .pkey = "seq2" });
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "sec.ssi", .data = buf.items });
+    const file = try tmp_dir.dir.openFile("sec.ssi", .{});
+
+    var idx = try EaselIndex.read(allocator, file);
+    defer idx.deinit();
+
+    // Look up via secondary key "acc2".
+    {
+        const entry = (try idx.lookup(allocator, "acc2")).?;
+        defer allocator.free(entry.name);
+        // The returned name should be the SEARCH key, not the primary key.
+        try std.testing.expectEqualStrings("acc2", entry.name);
+        try std.testing.expectEqual(@as(u64, 200), entry.offset);
+        try std.testing.expectEqual(@as(u64, 220), entry.data_offset);
+        try std.testing.expectEqual(@as(u64, 75), entry.seq_len);
+    }
+
+    // Look up via secondary key "acc1".
+    {
+        const entry = (try idx.lookup(allocator, "acc1")).?;
+        defer allocator.free(entry.name);
+        try std.testing.expectEqualStrings("acc1", entry.name);
+        try std.testing.expectEqual(@as(u64, 100), entry.offset);
+        try std.testing.expectEqual(@as(u64, 110), entry.data_offset);
+        try std.testing.expectEqual(@as(u64, 50), entry.seq_len);
+    }
+
+    // Missing secondary key returns null.
+    {
+        const result = try idx.lookup(allocator, "acc3");
+        try std.testing.expect(result == null);
+    }
 }
