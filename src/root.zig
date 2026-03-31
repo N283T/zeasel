@@ -11,6 +11,9 @@ pub const util = @import("util.zig");
 pub const distance = @import("distance.zig");
 pub const gencode = @import("gencode.zig");
 pub const dsqdata = @import("dsqdata.zig");
+pub const tree = @import("tree.zig");
+pub const matrix = @import("matrix.zig");
+pub const wuss = @import("wuss.zig");
 
 // Include tests from all sub-modules in `zig build test`.
 test {
@@ -27,4 +30,7 @@ test {
     _ = distance;
     _ = gencode;
     _ = dsqdata;
+    _ = tree;
+    _ = matrix;
+    _ = wuss;
 }
