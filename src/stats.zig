@@ -8,6 +8,7 @@ pub const rootfinder = @import("stats/rootfinder.zig");
 pub const histogram = @import("stats/histogram.zig");
 pub const normal = @import("stats/normal.zig");
 pub const weibull = @import("stats/weibull.zig");
+pub const functions = @import("stats/functions.zig");
 
 test {
     _ = gumbel;
@@ -19,4 +20,5 @@ test {
     _ = histogram;
     _ = normal;
     _ = weibull;
+    _ = functions;
 }
