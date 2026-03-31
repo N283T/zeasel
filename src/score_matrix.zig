@@ -3,63 +3,90 @@
 // Canonical residue order (amino acid digital codes 0-19):
 //   A=0, C=1, D=2, E=3, F=4, G=5, H=6, I=7, K=8, L=9,
 //   M=10, N=11, P=12, Q=13, R=14, S=15, T=16, V=17, W=18, Y=19
+//
+// The full matrix is Kp x Kp (29 x 29 for amino acids), covering
+// canonical residues, gap, degenerate codes (B, J, Z, O, U, X),
+// nonresidue (*), and missing data (~).
 
 const std = @import("std");
 const math = std.math;
 const alphabet_mod = @import("alphabet.zig");
 const Alphabet = alphabet_mod.Alphabet;
 const composition = @import("composition.zig");
+const Allocator = std.mem.Allocator;
+
+/// Size of the full score matrix dimension (amino acid Kp).
+pub const Kp: usize = 29;
+
+/// Integer division with rounding to nearest (half away from zero).
+fn roundedDiv(num: i32, den: i32) i32 {
+    if (num >= 0) {
+        return @divTrunc(num + @divTrunc(den, 2), den);
+    } else {
+        return @divTrunc(num - @divTrunc(den, 2), den);
+    }
+}
 
 pub const ScoreMatrix = struct {
-    /// Raw score table: data[i][j] for canonical residue digital codes i, j (0..K-1).
-    data: *const [20][20]i8,
+    /// Raw score table: data[i][j] for residue digital codes i, j (0..Kp-1).
+    /// Positions beyond canonical residues hold degenerate/gap/special scores.
+    data: *const [Kp][Kp]i16,
     /// Human-readable name (e.g. "BLOSUM62").
     name: []const u8,
     /// Associated alphabet.
     abc: *const Alphabet,
+    /// If non-null, this matrix owns its data (allocated at runtime).
+    owned: ?*[Kp][Kp]i16 = null,
+    /// Allocator used for owned data (null for comptime matrices).
+    allocator: ?Allocator = null,
+    /// Allocated name storage (null for comptime matrices).
+    owned_name: ?[]u8 = null,
 
-    /// Return score for two digital codes (canonical residues only).
-    pub fn score(self: ScoreMatrix, i: u8, j: u8) i8 {
-        std.debug.assert(i < 20 and j < 20);
+    /// Return score for two digital codes.
+    pub fn score(self: ScoreMatrix, i: u8, j: u8) i16 {
+        std.debug.assert(i < Kp and j < Kp);
         return self.data[i][j];
     }
 
     /// Return score for two ASCII residue characters.
-    /// Returns error.InvalidCharacter if either character is not a canonical residue.
-    pub fn scoreByChar(self: ScoreMatrix, a: u8, b: u8) !i8 {
+    /// Returns error.InvalidCharacter if either character is not recognized.
+    pub fn scoreByChar(self: ScoreMatrix, a: u8, b: u8) !i16 {
         const i = try self.abc.encode(a);
         const j = try self.abc.encode(b);
-        if (i >= self.abc.k or j >= self.abc.k) return error.InvalidCharacter;
+        if (i >= Kp or j >= Kp) return error.InvalidCharacter;
         return self.data[i][j];
     }
 
-    /// Check if the matrix is symmetric (S[i][j] == S[j][i] for all i,j).
+    /// Check if the matrix is symmetric (S[i][j] == S[j][i] for all i,j in 0..K-1).
     pub fn isSymmetric(self: ScoreMatrix) bool {
-        for (0..20) |i| {
-            for (i + 1..20) |j| {
+        const k = self.abc.k;
+        for (0..k) |i| {
+            for (i + 1..k) |j| {
                 if (self.data[i][j] != self.data[j][i]) return false;
             }
         }
         return true;
     }
 
-    /// Return the maximum score value in the matrix.
-    pub fn maxScore(self: ScoreMatrix) i8 {
-        var m: i8 = self.data[0][0];
-        for (self.data) |row| {
-            for (row) |val| {
-                if (val > m) m = val;
+    /// Return the maximum score value among canonical residue pairs.
+    pub fn maxScore(self: ScoreMatrix) i16 {
+        const k = self.abc.k;
+        var m: i16 = self.data[0][0];
+        for (0..k) |i| {
+            for (0..k) |j| {
+                if (self.data[i][j] > m) m = self.data[i][j];
             }
         }
         return m;
     }
 
-    /// Return the minimum score value in the matrix.
-    pub fn minScore(self: ScoreMatrix) i8 {
-        var m: i8 = self.data[0][0];
-        for (self.data) |row| {
-            for (row) |val| {
-                if (val < m) m = val;
+    /// Return the minimum score value among canonical residue pairs.
+    pub fn minScore(self: ScoreMatrix) i16 {
+        const k = self.abc.k;
+        var m: i16 = self.data[0][0];
+        for (0..k) |i| {
+            for (0..k) |j| {
+                if (self.data[i][j] < m) m = self.data[i][j];
             }
         }
         return m;
@@ -80,18 +107,14 @@ pub const ScoreMatrix = struct {
 
     /// Compute relative entropy H = sum_ij p_ij * log2(p_ij / (f_i * f_j))
     /// given background frequencies, where p_ij = f_i * f_j * exp(lambda * s_ij).
-    /// Returns the relative entropy in bits, or null if lambda cannot be estimated.
+    /// Returns the relative entropy in bits.
     pub fn relativeEntropy(self: ScoreMatrix, bg: *const [20]f64, lambda: f64) f64 {
-        // First compute the normalizing constant Z = sum_ij f_i * f_j * exp(lambda * s_ij)
         var z: f64 = 0;
         for (0..20) |i| {
             for (0..20) |j| {
                 z += bg[i] * bg[j] * @exp(lambda * @as(f64, @floatFromInt(self.data[i][j])));
             }
         }
-
-        // H = sum_ij p_ij * log2(p_ij / (f_i * f_j))
-        //   = sum_ij p_ij * (lambda * s_ij * log2(e) - log2(Z))
         var h: f64 = 0;
         for (0..20) |i| {
             for (0..20) |j| {
@@ -103,6 +126,241 @@ pub const ScoreMatrix = struct {
             }
         }
         return h;
+    }
+
+    /// Fill in scores for degenerate residue positions (indices >= K)
+    /// by averaging over the constituent canonical residue pairs using
+    /// the alphabet degeneracy bitmasks.
+    ///
+    /// For a degenerate code ip that maps to canonical set {a1, a2, ...}
+    /// and degenerate code jp that maps to {b1, b2, ...}, the score is:
+    ///   S[ip][jp] = round( sum(S[ai][bj]) / (n_ip * n_jp) )
+    ///
+    /// Gap (K), nonresidue (Kp-2), and missing (Kp-1) positions are set to 0.
+    pub fn setDegenerateScores(self: *ScoreMatrix) void {
+        const abc = self.abc;
+        const k: usize = abc.k;
+        const kp: usize = abc.kp;
+        const ptr = self.owned orelse unreachable;
+
+        // Fill canonical-to-degenerate: S[i][jp] for i < K, jp > K
+        for (0..k) |i| {
+            // Gap column
+            ptr[i][k] = 0;
+            // Degenerate columns: codes K+1 to Kp-4 (inclusive)
+            var jp: usize = k + 1;
+            while (jp + 2 < kp) : (jp += 1) {
+                const mask_jp = abc.degen[jp];
+                const n_jp: i32 = @intCast(abc.ndegen[jp]);
+                if (n_jp == 0) {
+                    ptr[i][jp] = 0;
+                    continue;
+                }
+                var sum: i32 = 0;
+                for (0..k) |j| {
+                    if (mask_jp & (@as(u32, 1) << @intCast(j)) != 0) {
+                        sum += ptr[i][j];
+                    }
+                }
+                ptr[i][jp] = @intCast(roundedDiv(sum, n_jp));
+            }
+            // Nonresidue and missing columns
+            ptr[i][kp - 2] = 0;
+            ptr[i][kp - 1] = 0;
+        }
+
+        // Gap row: all zeros
+        for (0..Kp) |j| {
+            ptr[k][j] = 0;
+        }
+
+        // Degenerate rows: S[ip][j] for all j
+        var ip: usize = k + 1;
+        while (ip + 2 < kp) : (ip += 1) {
+            const mask_ip = abc.degen[ip];
+            const n_ip: i32 = @intCast(abc.ndegen[ip]);
+            if (n_ip == 0) {
+                for (0..Kp) |j| {
+                    ptr[ip][j] = 0;
+                }
+                continue;
+            }
+
+            // Degenerate-to-canonical
+            for (0..k) |j| {
+                var sum: i32 = 0;
+                for (0..k) |ci| {
+                    if (mask_ip & (@as(u32, 1) << @intCast(ci)) != 0) {
+                        sum += ptr[ci][j];
+                    }
+                }
+                ptr[ip][j] = @intCast(roundedDiv(sum, n_ip));
+            }
+
+            // Gap
+            ptr[ip][k] = 0;
+
+            // Degenerate-to-degenerate
+            var jp2: usize = k + 1;
+            while (jp2 + 2 < kp) : (jp2 += 1) {
+                const mask_jp = abc.degen[jp2];
+                const n_jp: i32 = @intCast(abc.ndegen[jp2]);
+                if (n_jp == 0) {
+                    ptr[ip][jp2] = 0;
+                    continue;
+                }
+                var sum: i32 = 0;
+                for (0..k) |j| {
+                    if (mask_jp & (@as(u32, 1) << @intCast(j)) != 0) {
+                        sum += ptr[ip][j];
+                    }
+                }
+                ptr[ip][jp2] = @intCast(roundedDiv(sum, n_jp));
+            }
+
+            // Nonresidue and missing
+            ptr[ip][kp - 2] = 0;
+            ptr[ip][kp - 1] = 0;
+        }
+
+        // Nonresidue and missing rows: all zeros
+        for (0..Kp) |j| {
+            ptr[kp - 2][j] = 0;
+            ptr[kp - 1][j] = 0;
+        }
+    }
+
+    /// Parse a BLAST/NCBI format score matrix from text data.
+    ///
+    /// Format: lines starting with '#' are comments. The first non-comment
+    /// line is a header with single-letter residue labels. Subsequent rows
+    /// optionally have a leading residue label, followed by integer scores.
+    pub fn read(allocator: Allocator, abc: *const Alphabet, text: []const u8) !ScoreMatrix {
+        const data_ptr = try allocator.create([Kp][Kp]i16);
+        errdefer allocator.destroy(data_ptr);
+
+        // Initialize to zero
+        for (data_ptr) |*row| {
+            @memset(row, 0);
+        }
+
+        // Split into lines
+        var lines = std.mem.splitSequence(u8, text, "\n");
+
+        // Skip comment lines and find header
+        var header: ?[]const u8 = null;
+        while (lines.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r");
+            if (trimmed.len == 0) continue;
+            if (trimmed[0] == '#') continue;
+            header = trimmed;
+            break;
+        }
+
+        if (header == null) return error.InvalidFormat;
+
+        // Parse header: single-character labels
+        var col_map: [Kp]u8 = undefined; // maps column index -> digital code
+        var nc: usize = 0;
+        var hdr_iter = std.mem.tokenizeAny(u8, header.?, " \t");
+        while (hdr_iter.next()) |tok| {
+            if (tok.len != 1) return error.InvalidFormat;
+            if (nc >= Kp) return error.InvalidFormat;
+            const code = abc.encode(tok[0]) catch continue; // skip unknown chars like '*'
+            if (code >= Kp) continue;
+            col_map[nc] = code;
+            nc += 1;
+        }
+
+        // Verify all canonical residues are present
+        var have_canonical: [20]bool = .{false} ** 20;
+        for (0..nc) |c| {
+            if (col_map[c] < abc.k) {
+                have_canonical[col_map[c]] = true;
+            }
+        }
+        for (0..abc.k) |x| {
+            if (!have_canonical[x]) return error.InvalidFormat;
+        }
+
+        // Parse data rows
+        var row_idx: usize = 0;
+        while (lines.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r");
+            if (trimmed.len == 0) continue;
+            if (trimmed[0] == '#') continue;
+            if (row_idx >= nc) return error.InvalidFormat;
+
+            var col_idx: usize = 0;
+            var tok_iter = std.mem.tokenizeAny(u8, trimmed, " \t");
+            var skip_label = false;
+            while (tok_iter.next()) |tok| {
+                // Check if first token is a row label (single letter matching expected)
+                if (col_idx == 0 and !skip_label and tok.len == 1) {
+                    const maybe_code = abc.encode(tok[0]) catch null;
+                    if (maybe_code) |code| {
+                        if (code == col_map[row_idx]) {
+                            skip_label = true;
+                            continue;
+                        }
+                    }
+                    // Not a label, try to parse as number
+                }
+
+                if (col_idx >= nc) return error.InvalidFormat;
+                const val = std.fmt.parseInt(i16, tok, 10) catch return error.InvalidFormat;
+                data_ptr[col_map[row_idx]][col_map[col_idx]] = val;
+                col_idx += 1;
+            }
+
+            if (col_idx != nc) return error.InvalidFormat;
+            row_idx += 1;
+        }
+
+        if (row_idx != nc) return error.InvalidFormat;
+
+        return ScoreMatrix{
+            .data = data_ptr,
+            .name = "custom",
+            .abc = abc,
+            .owned = data_ptr,
+            .allocator = allocator,
+        };
+    }
+
+    /// Write the score matrix in BLAST/NCBI format.
+    pub fn write(self: ScoreMatrix, dest: std.io.AnyWriter) !void {
+        const k = self.abc.k;
+
+        // Header line with column labels
+        try dest.writeAll("  ");
+        for (0..k) |j| {
+            try dest.print("  {c} ", .{self.abc.decode(@intCast(j))});
+        }
+        try dest.writeByte('\n');
+
+        // Data rows
+        for (0..k) |i| {
+            try dest.print("{c} ", .{self.abc.decode(@intCast(i))});
+            for (0..k) |j| {
+                try dest.print("{d:>3} ", .{self.data[i][j]});
+            }
+            try dest.writeByte('\n');
+        }
+    }
+
+    /// Free runtime-allocated resources.
+    pub fn deinit(self: *ScoreMatrix) void {
+        if (self.allocator) |alloc| {
+            if (self.owned) |ptr| {
+                alloc.destroy(ptr);
+                self.owned = null;
+            }
+            if (self.owned_name) |name_ptr| {
+                alloc.free(name_ptr);
+                self.owned_name = null;
+            }
+        }
     }
 };
 
@@ -120,10 +378,26 @@ pub fn getByName(name: []const u8) ?ScoreMatrix {
 }
 
 // ---------------------------------------------------------------------------
+// Helper: embed a 20x20 i8 matrix into a Kp x Kp i16 matrix at comptime
+// ---------------------------------------------------------------------------
+
+fn embedCanonical(comptime src: [20][20]i8) [Kp][Kp]i16 {
+    var m: [Kp][Kp]i16 = .{.{0} ** Kp} ** Kp;
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        var j: usize = 0;
+        while (j < 20) : (j += 1) {
+            m[i][j] = src[i][j];
+        }
+    }
+    return m;
+}
+
+// ---------------------------------------------------------------------------
 // BLOSUM62 data
 // ---------------------------------------------------------------------------
 
-const blosum62_data: [20][20]i8 = .{
+const blosum62_canonical: [20][20]i8 = .{
     //  A   C   D   E   F   G   H   I   K   L   M   N   P   Q   R   S   T   V   W   Y
     .{  4,  0, -2, -1, -2,  0, -2, -1, -1, -1, -1, -2, -1, -1, -1,  1,  0,  0, -3, -2 }, // A
     .{  0,  9, -3, -4, -2, -3, -3, -1, -3, -1, -1, -3, -3, -3, -3, -1, -1, -1, -2, -2 }, // C
@@ -147,6 +421,8 @@ const blosum62_data: [20][20]i8 = .{
     .{ -2, -2, -3, -2,  3, -3,  2, -1, -2, -1, -1, -2, -3, -1, -2, -2, -2, -1,  2,  7 }, // Y
 };
 
+const blosum62_data: [Kp][Kp]i16 = embedCanonical(blosum62_canonical);
+
 pub const blosum62 = ScoreMatrix{
     .data = &blosum62_data,
     .name = "BLOSUM62",
@@ -157,7 +433,7 @@ pub const blosum62 = ScoreMatrix{
 // BLOSUM45 data
 // ---------------------------------------------------------------------------
 
-const blosum45_data: [20][20]i8 = .{
+const blosum45_canonical: [20][20]i8 = .{
     //  A   C   D   E   F   G   H   I   K   L   M   N   P   Q   R   S   T   V   W   Y
     .{  5, -1, -2, -1, -2,  0, -2, -1, -1, -1, -1, -1, -1, -1, -2,  1,  0,  0, -2, -2 }, // A
     .{ -1, 12, -3, -3, -2, -3, -3, -3, -3, -2, -2, -2, -4, -3, -3, -1, -1, -1, -5, -3 }, // C
@@ -181,6 +457,8 @@ const blosum45_data: [20][20]i8 = .{
     .{ -2, -3, -2, -2,  3, -3,  2,  0, -1,  0,  0, -2, -3, -1, -1, -2, -1, -1,  3,  8 }, // Y
 };
 
+const blosum45_data: [Kp][Kp]i16 = embedCanonical(blosum45_canonical);
+
 pub const blosum45 = ScoreMatrix{
     .data = &blosum45_data,
     .name = "BLOSUM45",
@@ -191,7 +469,7 @@ pub const blosum45 = ScoreMatrix{
 // BLOSUM80 data
 // ---------------------------------------------------------------------------
 
-const blosum80_data: [20][20]i8 = .{
+const blosum80_canonical: [20][20]i8 = .{
     //  A   C   D   E   F   G   H   I   K   L   M   N   P   Q   R   S   T   V   W   Y
     .{  7, -1, -3, -2, -4,  0, -3, -3, -1, -3, -2, -3, -1, -2, -3,  2,  0, -1, -5, -4 }, // A
     .{ -1, 13, -7, -7, -4, -6, -7, -2, -6, -3, -3, -5, -6, -5, -6, -2, -2, -2, -5, -5 }, // C
@@ -215,6 +493,8 @@ const blosum80_data: [20][20]i8 = .{
     .{ -4, -5, -6, -5,  4, -6,  3, -3, -4, -2, -3, -4, -6, -3, -4, -3, -3, -3,  3, 11 }, // Y
 };
 
+const blosum80_data: [Kp][Kp]i16 = embedCanonical(blosum80_canonical);
+
 pub const blosum80 = ScoreMatrix{
     .data = &blosum80_data,
     .name = "BLOSUM80",
@@ -225,7 +505,7 @@ pub const blosum80 = ScoreMatrix{
 // PAM30 data
 // ---------------------------------------------------------------------------
 
-const pam30_data: [20][20]i8 = .{
+const pam30_canonical: [20][20]i8 = .{
     //  A   C   D   E   F   G   H   I   K   L   M   N   P   Q   R   S   T   V   W   Y
     .{  6, -6, -3, -2, -8,  0, -7, -5, -7, -6, -5, -4, -2, -4, -7,  0, -1, -2,-13, -8 }, // A
     .{ -6, 10,-14,-14,-13, -9, -7, -6,-14,-15,-13,-11, -8,-14, -8, -3, -8, -6,-15, -4 }, // C
@@ -249,6 +529,8 @@ const pam30_data: [20][20]i8 = .{
     .{ -8, -4,-11, -8,  2,-14, -3, -6, -9, -7,-11, -4,-13,-12,-10, -7, -6, -7, -5, 10 }, // Y
 };
 
+const pam30_data: [Kp][Kp]i16 = embedCanonical(pam30_canonical);
+
 pub const pam30 = ScoreMatrix{
     .data = &pam30_data,
     .name = "PAM30",
@@ -259,7 +541,7 @@ pub const pam30 = ScoreMatrix{
 // PAM70 data
 // ---------------------------------------------------------------------------
 
-const pam70_data: [20][20]i8 = .{
+const pam70_canonical: [20][20]i8 = .{
     //  A   C   D   E   F   G   H   I   K   L   M   N   P   Q   R   S   T   V   W   Y
     .{  5, -4, -1, -1, -6,  0, -4, -2, -4, -4, -3, -2, -1, -2, -4,  1,  1, -1, -9, -5 }, // A
     .{ -4,  9, -9, -9, -8, -6, -5, -4, -9,-10, -9, -7, -5, -9, -5, -1, -5, -4,-11, -2 }, // C
@@ -283,6 +565,8 @@ const pam70_data: [20][20]i8 = .{
     .{ -5, -2, -7, -6,  4, -9, -1, -5, -7, -4, -7, -3, -9, -8, -7, -5, -4, -5, -3,  9 }, // Y
 };
 
+const pam70_data: [Kp][Kp]i16 = embedCanonical(pam70_canonical);
+
 pub const pam70 = ScoreMatrix{
     .data = &pam70_data,
     .name = "PAM70",
@@ -290,10 +574,10 @@ pub const pam70 = ScoreMatrix{
 };
 
 // ---------------------------------------------------------------------------
-// PAM120 and PAM250 (abbreviated — diagonal + key off-diagonals)
+// PAM120 data
 // ---------------------------------------------------------------------------
 
-const pam120_data: [20][20]i8 = .{
+const pam120_canonical: [20][20]i8 = .{
     .{  3, -3,  0,  0, -4,  1, -3, -1, -2, -3, -2, -1,  1, -1, -3,  1,  1,  0, -7, -4 }, // A
     .{ -3,  9, -7, -7, -6, -5, -4, -3, -7, -7, -6, -5, -4, -7, -4,  0, -3, -3, -8, -1 }, // C
     .{  0, -7,  5,  3, -7, -1,  0, -3, -1, -5, -4,  2, -3,  1, -3,  0, -1, -3, -8, -5 }, // D
@@ -316,13 +600,19 @@ const pam120_data: [20][20]i8 = .{
     .{ -4, -1, -5, -5,  4, -6, -1, -2, -5, -2, -4, -2, -6, -5, -5, -3, -3, -3, -2,  8 }, // Y
 };
 
+const pam120_data: [Kp][Kp]i16 = embedCanonical(pam120_canonical);
+
 pub const pam120 = ScoreMatrix{
     .data = &pam120_data,
     .name = "PAM120",
     .abc = &alphabet_mod.amino,
 };
 
-const pam250_data: [20][20]i8 = .{
+// ---------------------------------------------------------------------------
+// PAM250 data
+// ---------------------------------------------------------------------------
+
+const pam250_canonical: [20][20]i8 = .{
     .{  2, -2,  0,  0, -3,  1, -1, -1, -1, -2, -1,  0,  1,  0, -2,  1,  1,  0, -6, -3 }, // A
     .{ -2, 12, -5, -5, -4, -3, -3, -2, -5, -6, -5, -4, -3, -5, -4,  0, -2, -2, -8,  0 }, // C
     .{  0, -5,  4,  3, -6,  1,  1, -2,  0, -4, -3,  2, -1,  2, -1,  0,  0, -2, -7, -4 }, // D
@@ -345,6 +635,8 @@ const pam250_data: [20][20]i8 = .{
     .{ -3,  0, -4, -4,  7, -5,  0, -1, -4, -1, -2, -2, -5, -4, -4, -3, -3, -2,  0, 10 }, // Y
 };
 
+const pam250_data: [Kp][Kp]i16 = embedCanonical(pam250_canonical);
+
 pub const pam250 = ScoreMatrix{
     .data = &pam250_data,
     .name = "PAM250",
@@ -355,8 +647,8 @@ pub const pam250 = ScoreMatrix{
 // Identity matrix: +1 for match, -1 for mismatch.
 // ---------------------------------------------------------------------------
 
-const identity_data: [20][20]i8 = blk: {
-    var m: [20][20]i8 = undefined;
+const identity_data: [Kp][Kp]i16 = blk: {
+    var m: [Kp][Kp]i16 = .{.{0} ** Kp} ** Kp;
     var i: usize = 0;
     while (i < 20) : (i += 1) {
         var j: usize = 0;
@@ -378,13 +670,13 @@ pub const identity = ScoreMatrix{
 // ---------------------------------------------------------------------------
 
 test "blosum62: diagonal values" {
-    try std.testing.expectEqual(@as(i8, 4), blosum62.score(0, 0));
-    try std.testing.expectEqual(@as(i8, 9), blosum62.score(1, 1));
-    try std.testing.expectEqual(@as(i8, 11), blosum62.score(18, 18));
+    try std.testing.expectEqual(@as(i16, 4), blosum62.score(0, 0));
+    try std.testing.expectEqual(@as(i16, 9), blosum62.score(1, 1));
+    try std.testing.expectEqual(@as(i16, 11), blosum62.score(18, 18));
 }
 
 test "blosum62: off-diagonal values" {
-    try std.testing.expectEqual(@as(i8, 0), blosum62.score(0, 1));
+    try std.testing.expectEqual(@as(i16, 0), blosum62.score(0, 1));
 }
 
 test "blosum62: symmetry" {
@@ -392,14 +684,14 @@ test "blosum62: symmetry" {
 }
 
 test "blosum62: scoreByChar valid" {
-    try std.testing.expectEqual(@as(i8, 4), try blosum62.scoreByChar('A', 'A'));
-    try std.testing.expectEqual(@as(i8, 11), try blosum62.scoreByChar('W', 'W'));
-    try std.testing.expectEqual(@as(i8, 0), try blosum62.scoreByChar('A', 'C'));
+    try std.testing.expectEqual(@as(i16, 4), try blosum62.scoreByChar('A', 'A'));
+    try std.testing.expectEqual(@as(i16, 11), try blosum62.scoreByChar('W', 'W'));
+    try std.testing.expectEqual(@as(i16, 0), try blosum62.scoreByChar('A', 'C'));
 }
 
 test "blosum62: scoreByChar case-insensitive" {
-    try std.testing.expectEqual(@as(i8, 4), try blosum62.scoreByChar('a', 'a'));
-    try std.testing.expectEqual(@as(i8, 11), try blosum62.scoreByChar('w', 'W'));
+    try std.testing.expectEqual(@as(i16, 4), try blosum62.scoreByChar('a', 'a'));
+    try std.testing.expectEqual(@as(i16, 11), try blosum62.scoreByChar('w', 'W'));
 }
 
 test "blosum62: scoreByChar invalid character" {
@@ -407,15 +699,16 @@ test "blosum62: scoreByChar invalid character" {
     try std.testing.expectError(error.InvalidCharacter, blosum62.scoreByChar('A', '!'));
 }
 
-test "blosum62: scoreByChar non-canonical (gap) returns error" {
-    try std.testing.expectError(error.InvalidCharacter, blosum62.scoreByChar('-', 'A'));
+test "blosum62: scoreByChar degenerate residue" {
+    // B is code 21 (D|N), should return 0 for comptime matrix (no degenerate scores set)
+    try std.testing.expectEqual(@as(i16, 0), try blosum62.scoreByChar('B', 'A'));
 }
 
 test "identity: match and mismatch" {
-    try std.testing.expectEqual(@as(i8, 1), identity.score(0, 0));
-    try std.testing.expectEqual(@as(i8, -1), identity.score(0, 1));
-    try std.testing.expectEqual(@as(i8, 1), identity.score(19, 19));
-    try std.testing.expectEqual(@as(i8, -1), identity.score(0, 19));
+    try std.testing.expectEqual(@as(i16, 1), identity.score(0, 0));
+    try std.testing.expectEqual(@as(i16, -1), identity.score(0, 1));
+    try std.testing.expectEqual(@as(i16, 1), identity.score(19, 19));
+    try std.testing.expectEqual(@as(i16, -1), identity.score(0, 19));
 }
 
 test "identity: symmetry" {
@@ -423,16 +716,16 @@ test "identity: symmetry" {
 }
 
 test "blosum62: known off-diagonal values" {
-    try std.testing.expectEqual(@as(i8, 2), blosum62.score(2, 3));
-    try std.testing.expectEqual(@as(i8, 3), blosum62.score(4, 19));
-    try std.testing.expectEqual(@as(i8, -1), blosum62.score(0, 14));
-    try std.testing.expectEqual(@as(i8, 8), blosum62.score(6, 6));
-    try std.testing.expectEqual(@as(i8, 7), blosum62.score(12, 12));
+    try std.testing.expectEqual(@as(i16, 2), blosum62.score(2, 3));
+    try std.testing.expectEqual(@as(i16, 3), blosum62.score(4, 19));
+    try std.testing.expectEqual(@as(i16, -1), blosum62.score(0, 14));
+    try std.testing.expectEqual(@as(i16, 8), blosum62.score(6, 6));
+    try std.testing.expectEqual(@as(i16, 7), blosum62.score(12, 12));
 }
 
 test "maxScore and minScore" {
-    try std.testing.expectEqual(@as(i8, 11), blosum62.maxScore());
-    try std.testing.expectEqual(@as(i8, -4), blosum62.minScore());
+    try std.testing.expectEqual(@as(i16, 11), blosum62.maxScore());
+    try std.testing.expectEqual(@as(i16, -4), blosum62.minScore());
 }
 
 test "expectedScore: BLOSUM62 with BL62 background is negative" {
@@ -458,19 +751,86 @@ test "blosum45: symmetry" {
     try std.testing.expect(blosum45.isSymmetric());
 }
 
-test "blosum80: symmetry" {
-    try std.testing.expect(blosum80.isSymmetric());
+test "setDegenerateScores: B averages D and N" {
+    const allocator = std.testing.allocator;
+    // Clone blosum62 into an owned mutable matrix
+    const data_ptr = try allocator.create([Kp][Kp]i16);
+    defer allocator.destroy(data_ptr);
+    data_ptr.* = blosum62_data;
+
+    var sm = ScoreMatrix{
+        .data = data_ptr,
+        .name = "test",
+        .abc = &alphabet_mod.amino,
+        .owned = data_ptr,
+        .allocator = allocator,
+    };
+
+    sm.setDegenerateScores();
+
+    // B = D|N (code 21). S[A][B] should be average of S[A][D] and S[A][N]
+    // S[A][D] = -2, S[A][N] = -2 => avg = -2
+    const b_code: u8 = 21;
+    try std.testing.expectEqual(@as(i16, -2), sm.data[0][b_code]);
+
+    // S[B][B] should be average of S[D|N][D|N] = (S[D][D]+S[D][N]+S[N][D]+S[N][N])/4
+    // = (6 + 1 + 1 + 6) / 4 = 14/4 = 4 (rounded: (14 + 2) / 4 = 4)
+    try std.testing.expectEqual(@as(i16, 4), sm.data[b_code][b_code]);
 }
 
-test "pam120: symmetry" {
-    try std.testing.expect(pam120.isSymmetric());
+test "read: parse BLAST format matrix" {
+    const allocator = std.testing.allocator;
+
+    const matrix_text =
+        \\# Test matrix
+        \\   A  C  D  E  F  G  H  I  K  L  M  N  P  Q  R  S  T  V  W  Y
+        \\A  4  0 -2 -1 -2  0 -2 -1 -1 -1 -1 -2 -1 -1 -1  1  0  0 -3 -2
+        \\C  0  9 -3 -4 -2 -3 -3 -1 -3 -1 -1 -3 -3 -3 -3 -1 -1 -1 -2 -2
+        \\D -2 -3  6  2 -3 -1 -1 -3 -1 -4 -3  1 -1  0 -2  0 -1 -3 -4 -3
+        \\E -1 -4  2  5 -3 -2  0 -3  1 -3 -2  0 -1  2  0  0 -1 -2 -3 -2
+        \\F -2 -2 -3 -3  6 -3 -1  0 -3  0  0 -3 -4 -3 -3 -2 -2 -1  1  3
+        \\G  0 -3 -1 -2 -3  6 -2 -4 -2 -4 -3  0 -2 -2 -2  0 -2 -3 -2 -3
+        \\H -2 -3 -1  0 -1 -2  8 -3 -1 -3 -2  1 -2  0  0 -1 -2 -3 -2  2
+        \\I -1 -1 -3 -3  0 -4 -3  4 -3  2  1 -3 -3 -3 -3 -2 -1  3 -3 -1
+        \\K -1 -3 -1  1 -3 -2 -1 -3  5 -2 -1  0 -1  1  2  0 -1 -2 -3 -2
+        \\L -1 -1 -4 -3  0 -4 -3  2 -2  4  2 -3 -3 -2 -2 -2 -1  1 -2 -1
+        \\M -1 -1 -3 -2  0 -3 -2  1 -1  2  5 -2 -2  0 -1 -1 -1  1 -1 -1
+        \\N -2 -3  1  0 -3  0  1 -3  0 -3 -2  6 -2  0  0  1  0 -3 -4 -2
+        \\P -1 -3 -1 -1 -4 -2 -2 -3 -1 -3 -2 -2  7 -1 -2 -1 -1 -2 -4 -3
+        \\Q -1 -3  0  2 -3 -2  0 -3  1 -2  0  0 -1  5  1  0 -1 -2 -2 -1
+        \\R -1 -3 -2  0 -3 -2  0 -3  2 -2 -1  0 -2  1  5 -1 -1 -3 -3 -2
+        \\S  1 -1  0  0 -2  0 -1 -2  0 -2 -1  1 -1  0 -1  4  1 -2 -3 -2
+        \\T  0 -1 -1 -1 -2 -2 -2 -1 -1 -1 -1  0 -1 -1 -1  1  5  0 -2 -2
+        \\V  0 -1 -3 -2 -1 -3 -3  3 -2  1  1 -3 -2 -2 -3 -2  0  4 -3 -1
+        \\W -3 -2 -4 -3  1 -2 -2 -3 -3 -2 -1 -4 -4 -2 -3 -3 -2 -3 11  2
+        \\Y -2 -2 -3 -2  3 -3  2 -1 -2 -1 -1 -2 -3 -1 -2 -2 -2 -1  2  7
+    ;
+
+    var sm = try ScoreMatrix.read(allocator, &alphabet_mod.amino, matrix_text);
+    defer sm.deinit();
+
+    try std.testing.expectEqual(@as(i16, 4), sm.score(0, 0));
+    try std.testing.expectEqual(@as(i16, 9), sm.score(1, 1));
+    try std.testing.expectEqual(@as(i16, 11), sm.score(18, 18));
+    try std.testing.expectEqual(@as(i16, 0), sm.score(0, 1));
+    try std.testing.expect(sm.isSymmetric());
 }
 
-test "pam250: symmetry" {
-    try std.testing.expect(pam250.isSymmetric());
-}
+test "write: round-trip" {
+    const allocator = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
 
-test "relativeEntropy: BLOSUM62 is positive" {
-    const h = blosum62.relativeEntropy(&composition.bl62, 0.3466);
-    try std.testing.expect(h > 0);
+    try blosum62.write(buf.writer(allocator).any());
+
+    // Parse it back
+    var sm = try ScoreMatrix.read(allocator, &alphabet_mod.amino, buf.items);
+    defer sm.deinit();
+
+    // Verify canonical scores match
+    for (0..20) |i| {
+        for (0..20) |j| {
+            try std.testing.expectEqual(blosum62.data[i][j], sm.data[i][j]);
+        }
+    }
 }
