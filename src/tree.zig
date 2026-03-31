@@ -188,6 +188,273 @@ fn writeNewickNode(tree: Tree, dest: std.io.AnyWriter, node: i32) !void {
     }
 }
 
+/// Parse a Newick format string into a Tree.
+/// Supports labeled leaves, branch lengths, and nested clades.
+/// Example: "((A:0.1,B:0.2):0.3,C:0.4);"
+pub fn readNewick(allocator: Allocator, input: []const u8) !Tree {
+    // First pass: count leaves and internal nodes
+    var n_leaves: usize = 0;
+    var n_internal: usize = 0;
+    var i: usize = 0;
+    while (i < input.len) : (i += 1) {
+        switch (input[i]) {
+            '(' => n_internal += 1,
+            ',' => {},
+            ')' => {},
+            ';', '\n', '\r', ' ', '\t' => {},
+            ':' => {
+                // Skip branch length
+                i += 1;
+                while (i < input.len and input[i] != ',' and input[i] != ')' and input[i] != ';' and input[i] != '(' and input[i] != ' ') : (i += 1) {}
+                if (i < input.len) i -= 1; // will be incremented by loop
+            },
+            else => {
+                // Start of a leaf name
+                n_leaves += 1;
+                while (i + 1 < input.len and input[i + 1] != ':' and input[i + 1] != ',' and input[i + 1] != ')' and input[i + 1] != ';' and input[i + 1] != '(' and input[i + 1] != ' ') : (i += 1) {}
+            },
+        }
+    }
+
+    if (n_leaves == 0) return error.InvalidInput;
+    const total_nodes = n_leaves + n_internal;
+
+    var parent = try allocator.alloc(i32, total_nodes);
+    errdefer allocator.free(parent);
+    @memset(parent, -1);
+
+    var left_arr = try allocator.alloc(i32, total_nodes);
+    errdefer allocator.free(left_arr);
+    @memset(left_arr, -1);
+
+    var right_arr = try allocator.alloc(i32, total_nodes);
+    errdefer allocator.free(right_arr);
+    @memset(right_arr, -1);
+
+    var bl = try allocator.alloc(f64, total_nodes);
+    errdefer allocator.free(bl);
+    @memset(bl, 0.0);
+
+    var names_arr = try allocator.alloc(?[]const u8, total_nodes);
+    errdefer {
+        for (names_arr) |nm| if (nm) |name| allocator.free(name);
+        allocator.free(names_arr);
+    }
+    @memset(names_arr, null);
+
+    // Stack for parsing
+    var stack: std.ArrayList(usize) = .empty;
+    defer stack.deinit(allocator);
+
+    var next_leaf: usize = 0;
+    var next_internal: usize = n_leaves;
+    var current_node: ?usize = null;
+
+    i = 0;
+    while (i < input.len) : (i += 1) {
+        switch (input[i]) {
+            '(' => {
+                // Push current context, start new internal node
+                const new_node = next_internal;
+                next_internal += 1;
+                try stack.append(allocator, new_node);
+                current_node = null;
+            },
+            ',' => {
+                // current_node was the left child of the top-of-stack internal node
+                if (current_node) |cn| {
+                    if (stack.items.len > 0) {
+                        const parent_node = stack.items[stack.items.len - 1];
+                        if (left_arr[parent_node] < 0) {
+                            left_arr[parent_node] = @intCast(cn);
+                            parent[cn] = @intCast(parent_node);
+                        }
+                    }
+                }
+                current_node = null;
+            },
+            ')' => {
+                // Close the internal node
+                if (stack.items.len == 0) return error.InvalidInput;
+                const internal_node = stack.pop().?;
+
+                // Attach current_node as right child
+                if (current_node) |cn| {
+                    if (left_arr[internal_node] < 0) {
+                        left_arr[internal_node] = @intCast(cn);
+                    } else {
+                        right_arr[internal_node] = @intCast(cn);
+                    }
+                    parent[cn] = @intCast(internal_node);
+                }
+
+                current_node = internal_node;
+            },
+            ':' => {
+                // Parse branch length for current_node
+                i += 1;
+                const start = i;
+                while (i < input.len and input[i] != ',' and input[i] != ')' and input[i] != ';' and input[i] != '(' and input[i] != ' ' and input[i] != '\n') : (i += 1) {}
+                if (current_node) |cn| {
+                    bl[cn] = std.fmt.parseFloat(f64, input[start..i]) catch 0.0;
+                }
+                if (i < input.len) i -= 1;
+            },
+            ';', '\n', '\r', ' ', '\t' => {},
+            else => {
+                // Leaf name
+                const start = i;
+                while (i + 1 < input.len and input[i + 1] != ':' and input[i + 1] != ',' and input[i + 1] != ')' and input[i + 1] != ';' and input[i + 1] != '(') : (i += 1) {}
+                const leaf_node = next_leaf;
+                next_leaf += 1;
+                names_arr[leaf_node] = try allocator.dupe(u8, input[start .. i + 1]);
+
+                current_node = leaf_node;
+            },
+        }
+    }
+
+    return Tree{
+        .parent = parent,
+        .left = left_arr,
+        .right = right_arr,
+        .branch_length = bl,
+        .names = names_arr,
+        .n_nodes = total_nodes,
+        .n_leaves = n_leaves,
+        .allocator = allocator,
+    };
+}
+
+/// Build a tree using single-linkage clustering from a distance matrix.
+/// At each step, merges the two closest clusters. Distance to merged cluster
+/// is the minimum of distances to the two components.
+pub fn singleLinkage(allocator: Allocator, dist: []const f64, n: usize, leaf_names: []const []const u8) !Tree {
+    return genericLinkage(allocator, dist, n, leaf_names, .single);
+}
+
+/// Build a tree using complete-linkage clustering from a distance matrix.
+/// Distance to merged cluster is the maximum of distances to the two components.
+pub fn completeLinkage(allocator: Allocator, dist: []const f64, n: usize, leaf_names: []const []const u8) !Tree {
+    return genericLinkage(allocator, dist, n, leaf_names, .complete);
+}
+
+/// Build a tree using WPGMA (weighted pair group method with arithmetic mean).
+/// Like UPGMA but uses unweighted average (each subtree weighted equally regardless of size).
+pub fn wpgma(allocator: Allocator, dist: []const f64, n: usize, leaf_names: []const []const u8) !Tree {
+    return genericLinkage(allocator, dist, n, leaf_names, .wpgma);
+}
+
+const LinkageType = enum { single, complete, wpgma };
+
+fn genericLinkage(allocator: Allocator, dist: []const f64, n: usize, leaf_names: []const []const u8, linkage: LinkageType) !Tree {
+    const total_nodes = 2 * n - 1;
+
+    var parent_arr = try allocator.alloc(i32, total_nodes);
+    errdefer allocator.free(parent_arr);
+    @memset(parent_arr, -1);
+
+    var left_arr = try allocator.alloc(i32, total_nodes);
+    errdefer allocator.free(left_arr);
+    @memset(left_arr, -1);
+
+    var right_arr = try allocator.alloc(i32, total_nodes);
+    errdefer allocator.free(right_arr);
+    @memset(right_arr, -1);
+
+    var bl = try allocator.alloc(f64, total_nodes);
+    errdefer allocator.free(bl);
+    @memset(bl, 0.0);
+
+    var names_arr = try allocator.alloc(?[]const u8, total_nodes);
+    errdefer {
+        for (names_arr) |nm| if (nm) |name_v| allocator.free(name_v);
+        allocator.free(names_arr);
+    }
+    @memset(names_arr, null);
+    for (0..n) |idx| {
+        names_arr[idx] = try allocator.dupe(u8, leaf_names[idx]);
+    }
+
+    var d = try allocator.alloc(f64, total_nodes * total_nodes);
+    defer allocator.free(d);
+    @memset(d, std.math.inf(f64));
+    for (0..n) |ii| {
+        for (0..n) |jj| {
+            d[ii * total_nodes + jj] = dist[ii * n + jj];
+        }
+    }
+
+    var active = try allocator.alloc(bool, total_nodes);
+    defer allocator.free(active);
+    @memset(active, false);
+    for (0..n) |idx| active[idx] = true;
+
+    var height = try allocator.alloc(f64, total_nodes);
+    defer allocator.free(height);
+    @memset(height, 0.0);
+
+    var next_node: usize = n;
+
+    for (0..n - 1) |_| {
+        var min_d: f64 = std.math.inf(f64);
+        var mi: usize = 0;
+        var mj: usize = 0;
+        for (0..next_node) |ii| {
+            if (!active[ii]) continue;
+            for (ii + 1..next_node) |jj| {
+                if (!active[jj]) continue;
+                const dij = d[ii * total_nodes + jj];
+                if (dij < min_d) {
+                    min_d = dij;
+                    mi = ii;
+                    mj = jj;
+                }
+            }
+        }
+
+        const new_node = next_node;
+        left_arr[new_node] = @intCast(mi);
+        right_arr[new_node] = @intCast(mj);
+        parent_arr[mi] = @intCast(new_node);
+        parent_arr[mj] = @intCast(new_node);
+
+        const node_height = min_d / 2.0;
+        height[new_node] = node_height;
+        bl[mi] = node_height - height[mi];
+        bl[mj] = node_height - height[mj];
+
+        for (0..next_node) |k| {
+            if (!active[k] or k == mi or k == mj) continue;
+            const di = d[mi * total_nodes + k];
+            const dj = d[mj * total_nodes + k];
+            const new_d = switch (linkage) {
+                .single => @min(di, dj),
+                .complete => @max(di, dj),
+                .wpgma => (di + dj) / 2.0,
+            };
+            d[new_node * total_nodes + k] = new_d;
+            d[k * total_nodes + new_node] = new_d;
+        }
+
+        active[mi] = false;
+        active[mj] = false;
+        active[new_node] = true;
+        next_node += 1;
+    }
+
+    return Tree{
+        .parent = parent_arr,
+        .left = left_arr,
+        .right = right_arr,
+        .branch_length = bl,
+        .names = names_arr,
+        .n_nodes = total_nodes,
+        .n_leaves = n,
+        .allocator = allocator,
+    };
+}
+
 // --- Tests ---
 
 test "upgma: 3 sequences with known distances" {
@@ -269,4 +536,90 @@ test "upgma: single pair branch lengths sum to distance" {
     // Each leaf's branch length should be d/2
     try std.testing.expectApproxEqAbs(d / 2.0, tree.branch_length[0], 1e-10);
     try std.testing.expectApproxEqAbs(d / 2.0, tree.branch_length[1], 1e-10);
+}
+
+test "readNewick: simple 2-leaf tree" {
+    const allocator = std.testing.allocator;
+    var tree = try readNewick(allocator, "(A:0.1,B:0.2);");
+    defer tree.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), tree.n_leaves);
+    try std.testing.expectEqual(@as(usize, 3), tree.n_nodes);
+    try std.testing.expectEqualStrings("A", tree.names[0].?);
+    try std.testing.expectEqualStrings("B", tree.names[1].?);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.1), tree.branch_length[0], 1e-10);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.2), tree.branch_length[1], 1e-10);
+}
+
+test "readNewick: nested tree" {
+    const allocator = std.testing.allocator;
+    var tree = try readNewick(allocator, "((A:0.1,B:0.2):0.3,C:0.4);");
+    defer tree.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), tree.n_leaves);
+    try std.testing.expectEqual(@as(usize, 5), tree.n_nodes);
+    try std.testing.expectEqualStrings("A", tree.names[0].?);
+    try std.testing.expectEqualStrings("B", tree.names[1].?);
+    try std.testing.expectEqualStrings("C", tree.names[2].?);
+}
+
+test "readNewick: round trip with writeNewick" {
+    const allocator = std.testing.allocator;
+    var tree = try readNewick(allocator, "(A:0.100000,B:0.200000);");
+    defer tree.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try writeNewick(tree, buf.writer(allocator).any());
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "A:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "B:") != null);
+}
+
+test "singleLinkage: 3 sequences" {
+    const allocator = std.testing.allocator;
+    const dist = [_]f64{
+        0.0, 0.4, 0.8,
+        0.4, 0.0, 0.8,
+        0.8, 0.8, 0.0,
+    };
+    const names = [_][]const u8{ "A", "B", "C" };
+    var tree = try singleLinkage(allocator, &dist, 3, &names);
+    defer tree.deinit();
+
+    try std.testing.expectEqual(@as(usize, 5), tree.n_nodes);
+    try std.testing.expectEqual(@as(usize, 3), tree.n_leaves);
+    // A-B merged first at min distance 0.4
+    try std.testing.expectApproxEqAbs(@as(f64, 0.2), tree.branch_length[0], 1e-10);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.2), tree.branch_length[1], 1e-10);
+}
+
+test "completeLinkage: 3 sequences" {
+    const allocator = std.testing.allocator;
+    const dist = [_]f64{
+        0.0, 0.4, 0.8,
+        0.4, 0.0, 0.8,
+        0.8, 0.8, 0.0,
+    };
+    const names = [_][]const u8{ "A", "B", "C" };
+    var tree = try completeLinkage(allocator, &dist, 3, &names);
+    defer tree.deinit();
+
+    try std.testing.expectEqual(@as(usize, 5), tree.n_nodes);
+    // With complete linkage, distance from {A,B} to C = max(0.8, 0.8) = 0.8
+    // Same as single linkage for this symmetric case
+}
+
+test "wpgma: 3 sequences" {
+    const allocator = std.testing.allocator;
+    const dist = [_]f64{
+        0.0, 0.4, 0.8,
+        0.4, 0.0, 0.6,
+        0.8, 0.6, 0.0,
+    };
+    const names = [_][]const u8{ "A", "B", "C" };
+    var tree = try wpgma(allocator, &dist, 3, &names);
+    defer tree.deinit();
+
+    try std.testing.expectEqual(@as(usize, 5), tree.n_nodes);
+    // WPGMA: distance from {A,B} to C = (d(A,C) + d(B,C)) / 2 = (0.8 + 0.6) / 2 = 0.7
 }
