@@ -354,6 +354,52 @@ pub fn parse(allocator: Allocator, abc: *const Alphabet, data: []const u8) !Msa 
     return msa;
 }
 
+/// Parse ALL MSA records from a multi-MSA Stockholm file.
+/// Each record is delimited by "//". Returns a slice of Msa objects.
+/// Caller owns the returned slice and each Msa within it.
+pub fn parseAll(allocator: Allocator, abc: *const Alphabet, data: []const u8) ![]Msa {
+    var result = std.ArrayList(Msa){};
+    errdefer {
+        for (result.items) |*m| m.deinit();
+        result.deinit(allocator);
+    }
+
+    var pos: usize = 0;
+    while (pos < data.len) {
+        // Skip whitespace between records.
+        while (pos < data.len and (data[pos] == '\n' or data[pos] == '\r' or data[pos] == ' ' or data[pos] == '\t')) {
+            pos += 1;
+        }
+        if (pos >= data.len) break;
+
+        // Find the end of this record ("//") at start of a line.
+        const record_start = pos;
+        var record_end: ?usize = null;
+        var scan = pos;
+        while (scan < data.len) {
+            if (data[scan] == '/' and scan + 1 < data.len and data[scan + 1] == '/') {
+                if (scan == 0 or data[scan - 1] == '\n') {
+                    record_end = scan + 2;
+                    if (record_end.? < data.len and data[record_end.?] == '\r') record_end = record_end.? + 1;
+                    if (record_end.? < data.len and data[record_end.?] == '\n') record_end = record_end.? + 1;
+                    break;
+                }
+            }
+            scan += 1;
+        }
+
+        if (record_end == null) break;
+
+        const record = data[record_start..record_end.?];
+        var msa = try parse(allocator, abc, record);
+        errdefer msa.deinit();
+        try result.append(allocator, msa);
+        pos = record_end.?;
+    }
+
+    return result.toOwnedSlice(allocator);
+}
+
 /// Write an Msa in Stockholm format.
 /// Writes all markup stored in gf_markup/gc_markup/gs_markup/gr_markup.
 /// If the dedicated name/accession/description fields are set but not covered by
@@ -917,4 +963,66 @@ test "round-trip: full markup preserved" {
     // Convenience fields.
     try testing.expectEqualStrings("....", restored.consensus_ss.?);
     try testing.expectEqualStrings("xxxx", restored.reference.?);
+}
+
+test "parseAll: multiple MSA records" {
+    const allocator = testing.allocator;
+    const abc = &alphabet_mod.dna;
+
+    const data =
+        \\# STOCKHOLM 1.0
+        \\
+        \\seq1  ACGT
+        \\seq2  TTTT
+        \\//
+        \\# STOCKHOLM 1.0
+        \\
+        \\alpha  GGGG
+        \\beta   CCCC
+        \\//
+    ;
+
+    const msas = try parseAll(allocator, abc, data);
+    defer {
+        for (msas) |*m| m.deinit();
+        allocator.free(msas);
+    }
+
+    try testing.expectEqual(@as(usize, 2), msas.len);
+    try testing.expectEqual(@as(usize, 2), msas[0].nseq());
+    try testing.expectEqualStrings("seq1", msas[0].names[0]);
+    try testing.expectEqual(@as(usize, 2), msas[1].nseq());
+    try testing.expectEqualStrings("alpha", msas[1].names[0]);
+    try testing.expectEqualStrings("beta", msas[1].names[1]);
+}
+
+test "parseAll: single MSA record" {
+    const allocator = testing.allocator;
+    const abc = &alphabet_mod.dna;
+
+    const data =
+        \\# STOCKHOLM 1.0
+        \\
+        \\seq1  ACGT
+        \\//
+    ;
+
+    const msas = try parseAll(allocator, abc, data);
+    defer {
+        for (msas) |*m| m.deinit();
+        allocator.free(msas);
+    }
+
+    try testing.expectEqual(@as(usize, 1), msas.len);
+    try testing.expectEqual(@as(usize, 1), msas[0].nseq());
+}
+
+test "parseAll: empty input returns empty slice" {
+    const allocator = testing.allocator;
+    const abc = &alphabet_mod.dna;
+
+    const msas = try parseAll(allocator, abc, "");
+    defer allocator.free(msas);
+
+    try testing.expectEqual(@as(usize, 0), msas.len);
 }

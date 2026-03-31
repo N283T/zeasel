@@ -29,7 +29,7 @@ pub const Writer = struct {
         switch (self.format) {
             .fasta => try fasta.write(self.dest, seq, self.line_width),
             .stockholm => try fasta.write(self.dest, seq, self.line_width),
-            .genbank => try genbank.writeGenBank(self.dest, seq),
+            .genbank, .ddbj => try genbank.writeGenBank(self.dest, seq),
             .embl => try genbank.writeEmbl(self.dest, seq),
             // For alignment formats, fall back to FASTA per-sequence output.
             .clustal, .afa, .phylip, .a2m, .psiblast, .selex => try fasta.write(self.dest, seq, self.line_width),

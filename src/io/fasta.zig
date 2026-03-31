@@ -91,6 +91,9 @@ pub fn parseOne(allocator: Allocator, abc: *const Alphabet, data: []const u8, po
         try seq_buf.append(allocator, c);
     }
 
+    // A FASTA record with a header but no sequence data is invalid.
+    if (seq_buf.items.len == 0) return error.InvalidFormat;
+
     // Digitize accumulated sequence text
     const dsq = try abc.digitize(allocator, seq_buf.items);
     errdefer allocator.free(dsq);
@@ -235,6 +238,14 @@ test "parseAll: empty input returns empty slice" {
     defer allocator.free(seqs);
 
     try std.testing.expectEqual(@as(usize, 0), seqs.len);
+}
+
+test "parseAll: empty sequence returns error" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(
+        error.InvalidFormat,
+        parseAll(allocator, &alphabet_mod.dna, ">seq1\n>seq2\nACGT\n"),
+    );
 }
 
 test "parseAll: invalid format (no '>') returns error" {

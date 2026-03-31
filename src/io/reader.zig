@@ -35,6 +35,9 @@ pub const Format = enum {
     /// SELEX (old alignment format from Sean Eddy).
     /// Cannot be auto-detected; must be specified explicitly.
     selex,
+    /// DDBJ format — uses the same GenBank parser.
+    /// Cannot be auto-detected separately; must be specified explicitly.
+    ddbj,
 
     /// Detect format from the first non-whitespace bytes of data.
     pub fn detect(header: []const u8) ?Format {
@@ -47,6 +50,8 @@ pub const Format = enum {
         const rest = header[i..];
         if (std.mem.startsWith(u8, rest, "# STOCKHOLM")) return .stockholm;
         if (std.mem.startsWith(u8, rest, "LOCUS")) return .genbank;
+        // Some GenBank files start with a comment containing "Genetic Sequence Data Bank".
+        if (std.mem.indexOf(u8, rest[0..@min(rest.len, 120)], "Genetic Sequence Data Bank") != null) return .genbank;
         // EMBL/UniProt: two-letter tag "ID" followed by exactly 3 spaces
         if (std.mem.startsWith(u8, rest, "ID   ")) return .embl;
         if (std.mem.startsWith(u8, rest, "CLUSTAL")) return .clustal;
@@ -140,6 +145,7 @@ pub const Reader = struct {
             .a2m => return try nextA2m(self),
             .psiblast => return try nextPsiblast(self),
             .selex => return try nextSelex(self),
+            .ddbj => return try nextGenBank(self),
         }
     }
 
@@ -442,6 +448,10 @@ test "Format.detect: genbank" {
     try std.testing.expectEqual(@as(?Format, .genbank), Format.detect("LOCUS       SEQ1\n"));
 }
 
+test "Format.detect: genbank via Genetic Sequence Data Bank" {
+    try std.testing.expectEqual(@as(?Format, .genbank), Format.detect("Genetic Sequence Data Bank\nLOCUS SEQ1\n"));
+}
+
 test "Format.detect: embl" {
     try std.testing.expectEqual(@as(?Format, .embl), Format.detect("ID   X56734; SV 1;\n"));
 }
@@ -572,4 +582,28 @@ test "Reader.next: afa explicit format yields ungapped sequences" {
 
     const eof = try reader.next();
     try std.testing.expectEqual(@as(?Sequence, null), eof);
+}
+
+test "Reader.next: ddbj format uses genbank parser" {
+    const allocator = std.testing.allocator;
+    const data =
+        \\LOCUS       SEQ1
+        \\ORIGIN
+        \\        1 acgt
+        \\//
+        \\
+    ;
+
+    var reader = try Reader.fromMemory(allocator, &alphabet_mod.dna, data, .ddbj);
+    defer reader.deinit();
+
+    try std.testing.expectEqual(Format.ddbj, reader.format);
+
+    var seq1_ddbj = (try reader.next()) orelse return error.ExpectedSequence;
+    defer seq1_ddbj.deinit();
+    try std.testing.expectEqualStrings("SEQ1", seq1_ddbj.name);
+    try std.testing.expectEqual(@as(usize, 4), seq1_ddbj.dsq.len);
+
+    const eof_ddbj = try reader.next();
+    try std.testing.expectEqual(@as(?Sequence, null), eof_ddbj);
 }
