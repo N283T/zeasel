@@ -41,14 +41,17 @@ pub fn fromExchangeability(allocator: Allocator, s: Matrix, pi: []const f64) !Ma
 
 /// Normalize a rate matrix Q so that the expected number of
 /// substitutions per unit time is 1: -sum_i pi[i] * Q[i][i] = 1.
-pub fn normalize(q: *Matrix, pi: []const f64) void {
+/// Replaces Q's data with the scaled version.
+pub fn normalize(q: *Matrix, pi: []const f64) !void {
     const n = q.rows;
     var rate: f64 = 0;
     for (0..n) |i| {
         rate -= pi[i] * q.get(i, i);
     }
     if (rate > 0) {
-        q.scale(1.0 / rate);
+        const scaled = try q.scale(1.0 / rate);
+        q.allocator.free(q.data);
+        q.data = scaled.data;
     }
 }
 
@@ -98,7 +101,9 @@ pub fn setJukesCantor(allocator: Allocator, k: usize) !Matrix {
 
     // Normalize: uniform pi = 1/K, expected rate = -sum(pi[i]*Q[i][i]) = (K-1).
     // Scale so expected rate = 1.
-    q.scale(1.0 / (fk - 1.0));
+    const scaled = try q.scale(1.0 / (fk - 1.0));
+    q.allocator.free(q.data);
+    q.data = scaled.data;
 
     return q;
 }
@@ -128,7 +133,7 @@ pub fn setKimura(allocator: Allocator, alpha: f64, beta: f64) !Matrix {
 
     // Normalize to 1 substitution/site: pi = 0.25 uniform
     const pi = [_]f64{ 0.25, 0.25, 0.25, 0.25 };
-    normalize(&q, &pi);
+    try normalize(&q, &pi);
 
     return q;
 }
@@ -199,7 +204,7 @@ pub fn setWAG(allocator: Allocator, pi: ?[]const f64) !Matrix {
     }
 
     // Normalize to 1 substitution/site
-    normalize(&q, freqs);
+    try normalize(&q, freqs);
 
     return q;
 }
@@ -291,7 +296,7 @@ test "normalize: expected rate becomes 1" {
     var q = try fromExchangeability(allocator, s, &pi);
     defer q.deinit();
 
-    normalize(&q, &pi);
+    try normalize(&q, &pi);
 
     // Check: -sum(pi[i] * Q[i][i]) should be 1.0
     var rate: f64 = 0;

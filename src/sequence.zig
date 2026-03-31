@@ -204,6 +204,21 @@ pub const Sequence = struct {
         };
     }
 
+    /// Append additional residues to an existing sequence by digitizing the
+    /// text and extending dsq. Enables incremental building from multiple lines.
+    pub fn appendDigital(self: *Sequence, text: []const u8) !void {
+        const new_codes = try self.abc.digitize(self.allocator, text);
+        errdefer self.allocator.free(new_codes);
+
+        const old_len = self.dsq.len;
+        const combined = try self.allocator.alloc(u8, old_len + new_codes.len);
+        @memcpy(combined[0..old_len], self.dsq);
+        @memcpy(combined[old_len..], new_codes);
+        self.allocator.free(self.dsq);
+        self.allocator.free(new_codes);
+        self.dsq = combined;
+    }
+
     // --- Utilities ---
 
     /// Compute a checksum of the digital sequence data using Jenkins one-at-a-time hash.
@@ -681,4 +696,53 @@ test "SequenceBlock: auto-grow beyond initial capacity" {
     }
 
     try std.testing.expectEqual(@as(usize, 5), block.count);
+}
+
+test "appendDigital: incremental sequence building" {
+    const allocator = std.testing.allocator;
+    var seq = try Sequence.fromText(allocator, &alphabet_mod.dna, "seq1", "ACGT");
+    defer seq.deinit();
+
+    try seq.appendDigital("TGCA");
+
+    try std.testing.expectEqual(@as(usize, 8), seq.len());
+
+    const text = try seq.toText();
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("ACGTTGCA", text);
+}
+
+test "appendDigital: empty append is no-op" {
+    const allocator = std.testing.allocator;
+    var seq = try Sequence.fromText(allocator, &alphabet_mod.dna, "seq1", "ACGT");
+    defer seq.deinit();
+
+    try seq.appendDigital("");
+
+    try std.testing.expectEqual(@as(usize, 4), seq.len());
+}
+
+test "appendDigital: multiple appends" {
+    const allocator = std.testing.allocator;
+    var seq = try Sequence.fromText(allocator, &alphabet_mod.dna, "seq1", "AC");
+    defer seq.deinit();
+
+    try seq.appendDigital("GT");
+    try seq.appendDigital("AA");
+
+    try std.testing.expectEqual(@as(usize, 6), seq.len());
+
+    const text = try seq.toText();
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("ACGTAA", text);
+}
+
+test "appendDigital: invalid text returns error" {
+    const allocator = std.testing.allocator;
+    var seq = try Sequence.fromText(allocator, &alphabet_mod.dna, "seq1", "ACGT");
+    defer seq.deinit();
+
+    try std.testing.expectError(error.InvalidCharacter, seq.appendDigital("ACGZ"));
+    // Original sequence should be unchanged.
+    try std.testing.expectEqual(@as(usize, 4), seq.len());
 }

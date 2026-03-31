@@ -6,6 +6,7 @@ const Alphabet = @import("alphabet.zig").Alphabet;
 const Msa = @import("msa.zig").Msa;
 const Random = @import("util/random.zig").Random;
 const pairwiseIdentity = @import("msa_weight.zig").pairwiseIdentity;
+const wuss = @import("wuss.zig");
 
 // --- Union-Find helpers (local copies — not exported from msa_weight) ---
 
@@ -412,6 +413,34 @@ fn flushLeftBlock(seq: []u8, start: usize, len: usize, abc: *const Alphabet) voi
     while (write_pos < len) : (write_pos += 1) {
         seq[start + write_pos] = gap;
     }
+}
+
+/// Remove broken base pairs from a WUSS secondary structure annotation.
+/// Given a WUSS string and a column-keep mask, find all base pairs using
+/// `wuss.parseToPairs()`, then replace characters of broken pairs (where
+/// one partner is removed) with '.'.
+/// Returns a new string; caller owns it.
+pub fn removeBrokenBasepairs(allocator: Allocator, ss: []const u8, keep: []const bool) ![]u8 {
+    std.debug.assert(ss.len == keep.len);
+
+    const pairs = try wuss.parseToPairs(allocator, ss);
+    defer allocator.free(pairs);
+
+    const result = try allocator.alloc(u8, ss.len);
+    @memcpy(result, ss);
+
+    for (0..ss.len) |i| {
+        if (pairs[i] >= 0) {
+            const partner: usize = @intCast(pairs[i]);
+            // If either partner is removed, break both sides.
+            if (!keep[i] or !keep[partner]) {
+                result[i] = '.';
+                result[partner] = '.';
+            }
+        }
+    }
+
+    return result;
 }
 
 // --- Tests ---
@@ -830,4 +859,41 @@ test "flushLeftInserts: multiple residues in insert block" {
     const text = try flushed.abc.textize(allocator, flushed.seqs[0]);
     defer allocator.free(text);
     try std.testing.expectEqualStrings("ACG--T", text);
+}
+
+test "removeBrokenBasepairs: broken pair replaced with dots" {
+    const allocator = std.testing.allocator;
+    // SS: <<..>> means positions 0-1 paired with 5-4.
+    // Keep mask: remove column 0 -> pair (0,5) is broken.
+    const ss = "<<..>>";
+    const keep = [_]bool{ false, true, true, true, true, true };
+
+    const result = try removeBrokenBasepairs(allocator, ss, &keep);
+    defer allocator.free(result);
+
+    // Position 0 and 5 should be replaced with '.'.
+    // Position 1 and 4 remain paired.
+    try std.testing.expectEqualStrings(".<..>.", result);
+}
+
+test "removeBrokenBasepairs: all pairs intact" {
+    const allocator = std.testing.allocator;
+    const ss = "<<..>>";
+    const keep = [_]bool{ true, true, true, true, true, true };
+
+    const result = try removeBrokenBasepairs(allocator, ss, &keep);
+    defer allocator.free(result);
+
+    try std.testing.expectEqualStrings("<<..>>", result);
+}
+
+test "removeBrokenBasepairs: no pairs" {
+    const allocator = std.testing.allocator;
+    const ss = "......";
+    const keep = [_]bool{ true, false, true, false, true, true };
+
+    const result = try removeBrokenBasepairs(allocator, ss, &keep);
+    defer allocator.free(result);
+
+    try std.testing.expectEqualStrings("......", result);
 }

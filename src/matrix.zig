@@ -43,9 +43,11 @@ pub const Matrix = struct {
         return result;
     }
 
-    /// Scale all elements in-place by factor.
-    pub fn scale(self: *Matrix, factor: f64) void {
-        for (self.data) |*v| v.* *= factor;
+    /// Return a new matrix with all elements scaled by factor.
+    pub fn scale(self: Matrix, factor: f64) !Matrix {
+        const result = try self.allocator.dupe(f64, self.data);
+        for (result) |*v| v.* *= factor;
+        return Matrix{ .data = result, .rows = self.rows, .cols = self.cols, .allocator = self.allocator };
     }
 
     /// Return a new matrix C = A * B.
@@ -284,9 +286,8 @@ pub const Matrix = struct {
         const sfactor = t / @as(f64, @floatFromInt(@as(u64, 1) << @intCast(s)));
 
         // Scaled matrix A = sfactor * M
-        var a_mat = try self.clone();
+        var a_mat = try self.scale(sfactor);
         defer a_mat.deinit();
-        a_mat.scale(sfactor);
 
         // Padé(6,6) approximation: exp(A) ≈ (D + N) * (D - N)^(-1)
         // where N = sum_{k=1}^{q} c_k * A^k, D = sum_{k=0}^{q} (-1)^k * c_k * A^k
@@ -301,10 +302,10 @@ pub const Matrix = struct {
 
         // Compute Taylor series: exp(A) = I + A + A^2/2! + ... + A^12/12!
         for (1..13) |k| {
-            var new_term = try Matrix.multiply(self.allocator, term, a_mat);
-            new_term.scale(1.0 / @as(f64, @floatFromInt(k)));
+            var product = try Matrix.multiply(self.allocator, term, a_mat);
             term.deinit();
-            term = new_term;
+            term = try product.scale(1.0 / @as(f64, @floatFromInt(k)));
+            product.deinit();
 
             // Add term to result
             for (0..n * n) |idx| {
@@ -510,13 +511,17 @@ test "Matrix.add" {
     try std.testing.expectApproxEqAbs(@as(f64, 2.0), c.get(1, 1), 1e-10);
 }
 
-test "Matrix.scale in-place" {
+test "Matrix.scale returns new matrix" {
     const allocator = std.testing.allocator;
     var m = try Matrix.initIdentity(allocator, 2);
     defer m.deinit();
-    m.scale(3.0);
-    try std.testing.expectApproxEqAbs(@as(f64, 3.0), m.get(0, 0), 1e-10);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.0), m.get(0, 1), 1e-10);
+    var s = try m.scale(3.0);
+    defer s.deinit();
+    // Scaled matrix has correct values.
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), s.get(0, 0), 1e-10);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), s.get(0, 1), 1e-10);
+    // Original is unchanged.
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), m.get(0, 0), 1e-10);
 }
 
 test "Matrix.multiply: 2x2 * 2x2" {
