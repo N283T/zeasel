@@ -3,6 +3,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Msa = @import("msa.zig").Msa;
+const distance = @import("distance.zig");
+const tree_mod = @import("tree.zig");
 
 /// Compute position-based (PB/Henikoff & Henikoff 1994) weights for an MSA.
 ///
@@ -149,8 +151,148 @@ pub fn idFilter(allocator: Allocator, m: Msa, max_id: f64) ![]bool {
     return keep;
 }
 
-// TODO: GSC (Gerstein-Sonnhammer-Chothia) weights require a guide tree.
-// Depends on issue #13 (phylogenetic trees). Implement after that is available.
+/// Compute GSC (Gerstein-Sonnhammer-Chothia 1994) sequence weights.
+///
+/// Algorithm:
+///   1. Compute a pairwise fractional-difference distance matrix (1 - pid).
+///   2. Build a UPGMA guide tree from the distances.
+///   3. Distribute branch lengths from root to leaves:
+///      - Postorder: compute total branch length under each internal node.
+///      - Preorder: at each internal node, split the weight from above in
+///        proportion to left/right subtree branch lengths. When both subtree
+///        lengths are zero, split in proportion to clade sizes instead.
+///      - Each leaf's weight = its accumulated share + its own branch length.
+///   4. Normalize weights to sum to nseq.
+///
+/// Complexity: O(N^2 * L) for the distance matrix, O(N^3) for UPGMA,
+/// O(N) for the weight distribution. Memory: O(N^2) for the distance matrix.
+///
+/// Reference: Gerstein, Sonnhammer & Chothia, "A method to weight protein
+/// sequences to correct for unequal representation", JMB 236:1067-1078, 1994.
+///
+/// Returns an allocated slice of length nseq. Caller owns the memory.
+pub fn gsc(allocator: Allocator, m: Msa) ![]f64 {
+    const n = m.nseq();
+    if (n == 1) {
+        const weights = try allocator.alloc(f64, 1);
+        weights[0] = 1.0;
+        return weights;
+    }
+
+    // Step 1: Compute pairwise fractional-difference distance matrix.
+    // GSC uses raw fractional difference (1 - pid), not JC-corrected distances.
+    const dist_matrix = try distance.pairwiseDistanceMatrix(allocator, m, .none);
+    defer allocator.free(dist_matrix);
+
+    // Step 2: Build UPGMA guide tree.
+    var t = try tree_mod.upgma(allocator, dist_matrix, n, m.names);
+    defer t.deinit();
+
+    const total_nodes = t.n_nodes;
+    const n_leaves = t.n_leaves;
+
+    // Step 3: Compute clade sizes for each node.
+    const clade_size = try allocator.alloc(u32, total_nodes);
+    defer allocator.free(clade_size);
+    for (0..n_leaves) |i| clade_size[i] = 1;
+
+    // Compute clade sizes for internal nodes via postorder traversal.
+    // Internal nodes are indexed n_leaves..total_nodes-1. In the UPGMA tree,
+    // internal nodes are created in order, so node i always has children < i.
+    // Thus iterating from n_leaves upward is a valid postorder.
+    for (n_leaves..total_nodes) |i| {
+        const lc: usize = @intCast(t.left[i]);
+        const rc: usize = @intCast(t.right[i]);
+        clade_size[i] = clade_size[lc] + clade_size[rc];
+    }
+
+    // x[i] stores different things in postorder vs preorder passes.
+    const x = try allocator.alloc(f64, total_nodes);
+    defer allocator.free(x);
+    @memset(x, 0.0);
+
+    // Postorder: compute total branch length under each internal node.
+    for (n_leaves..total_nodes) |i| {
+        const lc: usize = @intCast(t.left[i]);
+        const rc: usize = @intCast(t.right[i]);
+        x[i] = t.branch_length[lc] + t.branch_length[rc];
+        if (lc >= n_leaves) x[i] += x[lc];
+        if (rc >= n_leaves) x[i] += x[rc];
+    }
+
+    // Preorder: distribute weight from root to leaves.
+    // x[i] is now repurposed to mean "weight accumulated above node i".
+    const root = total_nodes - 1;
+    x[root] = 0.0; // no branch above the root
+
+    const weights = try allocator.alloc(f64, n);
+
+    // Process internal nodes from root downward. Since internal node indices
+    // increase from n_leaves to total_nodes-1, and parent index > child index,
+    // iterating in reverse is a valid preorder.
+    var i_signed: i64 = @intCast(root);
+    while (i_signed >= @as(i64, @intCast(n_leaves))) : (i_signed -= 1) {
+        const i: usize = @intCast(i_signed);
+        const lc: usize = @intCast(t.left[i]);
+        const rc: usize = @intCast(t.right[i]);
+
+        // Total branch weight in left and right subtrees.
+        var lw: f64 = t.branch_length[lc];
+        if (lc >= n_leaves) lw += x[lc]; // x[lc] still holds subtree length from postorder
+        var rw: f64 = t.branch_length[rc];
+        if (rc >= n_leaves) rw += x[rc];
+
+        var lx: f64 = undefined;
+        var rx: f64 = undefined;
+
+        if (lw + rw == 0.0) {
+            // Special case: all branch lengths zero in subtree.
+            // Split in proportion to clade sizes.
+            const cs_i: f64 = @floatFromInt(clade_size[i]);
+            if (lc >= n_leaves) {
+                lx = x[i] * @as(f64, @floatFromInt(clade_size[lc])) / cs_i;
+            } else {
+                lx = x[i] / cs_i;
+            }
+            if (rc >= n_leaves) {
+                rx = x[i] * @as(f64, @floatFromInt(clade_size[rc])) / cs_i;
+            } else {
+                rx = x[i] / cs_i;
+            }
+        } else {
+            // Normal case: split in proportion to branch weight.
+            lx = x[i] * lw / (lw + rw);
+            rx = x[i] * rw / (lw + rw);
+        }
+
+        // Assign to children: if leaf, record final weight; if internal, store for next iteration.
+        if (lc < n_leaves) {
+            weights[lc] = lx + t.branch_length[lc];
+        } else {
+            x[lc] = lx + t.branch_length[lc];
+        }
+
+        if (rc < n_leaves) {
+            weights[rc] = rx + t.branch_length[rc];
+        } else {
+            x[rc] = rx + t.branch_length[rc];
+        }
+    }
+
+    // Step 4: Normalize weights to sum to nseq.
+    // When all branch lengths are zero (e.g., all sequences identical),
+    // all raw weights are zero; fall back to equal weights.
+    var total: f64 = 0.0;
+    for (weights) |w| total += w;
+    if (total > 0.0) {
+        const scale = @as(f64, @floatFromInt(n)) / total;
+        for (weights) |*w| w.* *= scale;
+    } else {
+        for (weights) |*w| w.* = 1.0;
+    }
+
+    return weights;
+}
 
 /// Compute percent identity between two aligned sequences.
 /// Positions where either sequence has a gap are excluded from the comparison.
@@ -328,4 +470,104 @@ test "blosum: 2 identical + 1 different at threshold 0.62" {
     try std.testing.expectApproxEqAbs(@as(f64, 0.75), w[0], 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 0.75), w[1], 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 1.5), w[2], 1e-9);
+}
+
+test "gsc: single sequence returns weight 1.0" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+    const names = [_][]const u8{"s1"};
+    const seqs = [_][]const u8{"ACGT"};
+    var m = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer m.deinit();
+    const w = try gsc(allocator, m);
+    defer allocator.free(w);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), w[0], 1e-9);
+}
+
+test "gsc: 2 identical sequences get equal weights" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+    const names = [_][]const u8{ "s1", "s2" };
+    const seqs = [_][]const u8{ "ACGT", "ACGT" };
+    var m = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer m.deinit();
+    const w = try gsc(allocator, m);
+    defer allocator.free(w);
+    // Identical sequences should get equal weights, each = 1.0 (sum = nseq = 2)
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), w[0], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), w[1], 1e-9);
+}
+
+test "gsc: 2 completely different sequences get equal weights" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+    const names = [_][]const u8{ "s1", "s2" };
+    const seqs = [_][]const u8{ "AAAA", "TTTT" };
+    var m = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer m.deinit();
+    const w = try gsc(allocator, m);
+    defer allocator.free(w);
+    // Two sequences always get equal weight after normalization
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), w[0], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), w[1], 1e-9);
+}
+
+test "gsc: weights sum to nseq" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+    const names = [_][]const u8{ "s1", "s2", "s3", "s4" };
+    const seqs = [_][]const u8{ "ACGT", "ACGT", "TTTT", "AATT" };
+    var m = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer m.deinit();
+    const w = try gsc(allocator, m);
+    defer allocator.free(w);
+    var total: f64 = 0.0;
+    for (w) |wt| total += wt;
+    try std.testing.expectApproxEqAbs(@as(f64, 4.0), total, 1e-9);
+}
+
+test "gsc: all weights non-negative" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+    const names = [_][]const u8{ "s1", "s2", "s3", "s4" };
+    const seqs = [_][]const u8{ "ACGT", "ACGT", "TTTT", "AATT" };
+    var m = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer m.deinit();
+    const w = try gsc(allocator, m);
+    defer allocator.free(w);
+    for (w) |wt| {
+        try std.testing.expect(wt >= 0.0);
+    }
+}
+
+test "gsc: unique sequence gets higher weight than duplicated ones" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+    // s1 and s2 are identical (close on the tree), s3 is unique.
+    // GSC should upweight s3 relative to s1 and s2.
+    const names = [_][]const u8{ "s1", "s2", "s3" };
+    const seqs = [_][]const u8{ "ACGT", "ACGT", "TTTT" };
+    var m = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer m.deinit();
+    const w = try gsc(allocator, m);
+    defer allocator.free(w);
+    // s1 and s2 should have equal weights (identical sequences)
+    try std.testing.expectApproxEqAbs(w[0], w[1], 1e-9);
+    // s3 should have higher weight than s1 or s2
+    try std.testing.expect(w[2] > w[0]);
+}
+
+test "gsc: 3 identical sequences get equal weights" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+    const names = [_][]const u8{ "s1", "s2", "s3" };
+    const seqs = [_][]const u8{ "ACGT", "ACGT", "ACGT" };
+    var m = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer m.deinit();
+    const w = try gsc(allocator, m);
+    defer allocator.free(w);
+    // All identical -> all equal weight, each = 1.0
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), w[0], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), w[1], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), w[2], 1e-9);
 }
