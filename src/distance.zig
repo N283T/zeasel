@@ -39,6 +39,30 @@ pub fn jukesCantor(pid: f64, alphabet_size: u32) f64 {
     return -scale * @log(arg);
 }
 
+/// Result of Jukes-Cantor distance estimation with variance.
+pub const JukesCantorResult = struct {
+    distance: f64,
+    variance: f64,
+};
+
+/// Generalized Jukes-Cantor distance correction with variance estimate.
+/// Returns both the corrected distance and its variance.
+/// Variance formula: variance = exp(2*K*d/(K-1)) * D * (1-D) / N
+/// where D = 1 - pid, d = JC distance, K = alphabet_size, N = n_compared.
+/// See Easel esl_dst_jukescantor() for reference.
+pub fn jukesCantorWithVariance(pid: f64, alphabet_size: u32, n_compared: u32) JukesCantorResult {
+    if (n_compared == 0) return .{ .distance = std.math.inf(f64), .variance = std.math.inf(f64) };
+    const k: f64 = @floatFromInt(alphabet_size);
+    const big_d = 1.0 - pid;
+    const scale = (k - 1.0) / k;
+    const arg = 1.0 - big_d / scale;
+    if (arg <= 0.0) return .{ .distance = std.math.inf(f64), .variance = std.math.inf(f64) };
+    const distance = -scale * @log(arg);
+    const n: f64 = @floatFromInt(n_compared);
+    const variance = @exp(2.0 * k * distance / (k - 1.0)) * big_d * (1.0 - big_d) / n;
+    return .{ .distance = distance, .variance = variance };
+}
+
 /// Kimura protein distance correction: d = -ln(1 - D - 0.2*D^2)
 /// where D = 1 - percent_identity. Returns inf if argument <= 0.
 pub fn kimura(pid: f64) f64 {
@@ -70,6 +94,41 @@ pub fn pairwiseDistanceMatrix(allocator: Allocator, m: Msa, correction: Correcti
         }
     }
     return matrix;
+}
+
+/// Compute average pairwise fractional identity for an MSA.
+/// For small MSAs where N*(N-1)/2 <= max_pairs, computes all pairs exhaustively.
+/// For large MSAs, subsamples up to max_pairs random pairs using a fixed seed
+/// for reproducibility. Returns 1.0 for single-sequence MSAs by convention.
+/// See Easel esl_dst_XAverageId() for reference.
+pub fn averageIdentity(allocator: Allocator, m: Msa, max_pairs: usize) !f64 {
+    _ = allocator;
+    const n = m.nseq();
+    if (n <= 1) return 1.0;
+
+    const total_pairs = n * (n - 1) / 2;
+    if (total_pairs <= max_pairs) {
+        // Exhaustive calculation over all pairs.
+        var sum: f64 = 0.0;
+        for (0..n) |i| {
+            for (i + 1..n) |j| {
+                sum += percentIdentity(m.abc, m.seqs[i], m.seqs[j]);
+            }
+        }
+        return sum / @as(f64, @floatFromInt(total_pairs));
+    } else {
+        // Stochastic subsampling with fixed seed for reproducibility.
+        const Random = @import("util/random.zig").Random;
+        var rng = Random.init(42);
+        var sum: f64 = 0.0;
+        for (0..max_pairs) |_| {
+            const i = rng.uniformInt(@intCast(n));
+            var j = rng.uniformInt(@intCast(n - 1));
+            if (j >= i) j += 1;
+            sum += percentIdentity(m.abc, m.seqs[i], m.seqs[j]);
+        }
+        return sum / @as(f64, @floatFromInt(max_pairs));
+    }
 }
 
 // --- Tests ---
@@ -180,4 +239,66 @@ test "pairwiseDistanceMatrix: 3 seqs, symmetric, diagonal zero" {
     try std.testing.expectApproxEqAbs(@as(f64, 0.5), mat[0 * n + 1], 1e-10);
     // s1 vs s3: "AAAA" vs "TTTT" -> 0 matches / 4 compared = 0.0 pid -> dist = 1.0
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), mat[0 * n + 2], 1e-10);
+}
+
+test "jukesCantorWithVariance: pid=1.0 gives zero distance and zero variance" {
+    const result = jukesCantorWithVariance(1.0, 4, 100);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), result.distance, 1e-10);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), result.variance, 1e-10);
+}
+
+test "jukesCantorWithVariance: distance matches jukesCantor" {
+    const pid = 0.7;
+    const result = jukesCantorWithVariance(pid, 4, 200);
+    const expected_dist = jukesCantor(pid, 4);
+    try std.testing.expectApproxEqAbs(expected_dist, result.distance, 1e-10);
+    const expected_var = @exp(2.0 * 4.0 * expected_dist / 3.0) * 0.3 * 0.7 / 200.0;
+    try std.testing.expectApproxEqAbs(expected_var, result.variance, 1e-10);
+}
+
+test "jukesCantorWithVariance: saturated returns inf for both" {
+    const result = jukesCantorWithVariance(0.0, 4, 100);
+    try std.testing.expectEqual(std.math.inf(f64), result.distance);
+    try std.testing.expectEqual(std.math.inf(f64), result.variance);
+}
+
+test "jukesCantorWithVariance: n_compared=0 returns inf" {
+    const result = jukesCantorWithVariance(0.8, 4, 0);
+    try std.testing.expectEqual(std.math.inf(f64), result.distance);
+    try std.testing.expectEqual(std.math.inf(f64), result.variance);
+}
+
+test "averageIdentity: identical sequences returns 1.0" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+    const names = [_][]const u8{ "s1", "s2" };
+    const seqs = [_][]const u8{ "AAAA", "AAAA" };
+    var msa_data = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer msa_data.deinit();
+    const avg = try averageIdentity(allocator, msa_data, 10000);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), avg, 1e-10);
+}
+
+test "averageIdentity: single sequence returns 1.0" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+    const names = [_][]const u8{"s1"};
+    const seqs = [_][]const u8{"AAAA"};
+    var msa_data = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer msa_data.deinit();
+    const avg = try averageIdentity(allocator, msa_data, 10000);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), avg, 1e-10);
+}
+
+test "averageIdentity: 3 seqs exhaustive matches manual calculation" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+    const names = [_][]const u8{ "s1", "s2", "s3" };
+    const seqs = [_][]const u8{ "AAAA", "AATT", "TTTT" };
+    var msa_data = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer msa_data.deinit();
+    // s1 vs s2: pid=0.5, s1 vs s3: pid=0.0, s2 vs s3: pid=0.5
+    // average = (0.5 + 0.0 + 0.5) / 3 = 1/3
+    const avg = try averageIdentity(allocator, msa_data, 10000);
+    try std.testing.expectApproxEqAbs(1.0 / 3.0, avg, 1e-10);
 }
