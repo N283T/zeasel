@@ -94,16 +94,14 @@ pub fn fitComplete(x: []const f64) !struct { mu: f64, lambda: f64 } {
     };
 
     // Newton-Raphson iteration for lambda.
-    // Log-likelihood: n*log(lambda) - lambda*sum(xi) - sum(exp(-lambda*xi)) * ...
-    // The score equation for lambda reduces to:
-    //   1/lambda - mean(xi) + sum(xi * exp(-lambda*xi)) / sum(exp(-lambda*xi)) = 0
-    // We center by x_max: exp(-lambda*xi) = exp(-lambda*(xi-x_max)) * exp(-lambda*x_max).
-    // The exp(-lambda*x_max) factor cancels in all weighted-mean ratios, so only s0
-    // needs adjustment when deriving mu at the end.
+    // The score equation (profiling out mu) is:
+    //   f(lambda) = 1/lambda + weighted_mean(x) - mean(x) = 0
+    // We center by x_max to prevent overflow.
+    var converged = false;
     for (0..100) |_| {
-        var s0: f64 = 0.0; // sum of exp(-lambda * (xi - x_max))
-        var s1: f64 = 0.0; // sum of xi * exp(-lambda * (xi - x_max))
-        var s2: f64 = 0.0; // sum of xi^2 * exp(-lambda * (xi - x_max))
+        var s0: f64 = 0.0;
+        var s1: f64 = 0.0;
+        var s2: f64 = 0.0;
         for (x) |xi| {
             const e = @exp(-lambda * (xi - x_max));
             s0 += e;
@@ -111,24 +109,45 @@ pub fn fitComplete(x: []const f64) !struct { mu: f64, lambda: f64 } {
             s2 += xi * xi * e;
         }
 
-        // Gradient of log-likelihood w.r.t. lambda:
-        // dL/dlambda = n/lambda - sum(xi) + sum(xi*exp(-lambda*xi))/sum(exp(-lambda*xi))
-        // Wait — the full Gumbel log-likelihood includes the (x-mu) terms.
-        // Easel parametrizes as: score = 1/lambda + mean(xi*exp(-lambda*xi))/mean(exp(-lambda*xi)) - mean(xi)
-        // where we've already profiled out mu via mu = -(1/lambda)*log(mean(exp(-lambda*xi))).
-        const w_mean_x = s1 / s0; // weighted mean of x
+        const w_mean_x = s1 / s0;
         const gradient = (1.0 / lambda) + w_mean_x - mean;
 
-        // Second derivative (negative Hessian diagonal):
-        // d2L/dlambda2 = -n/lambda^2 - [ sum(x^2*e)/sum(e) - (sum(x*e)/sum(e))^2 ]
         const w_mean_x2 = s2 / s0;
         const hessian = -(1.0 / (lambda * lambda)) - (w_mean_x2 - w_mean_x * w_mean_x);
 
         const delta = gradient / hessian;
         lambda -= delta;
-        if (lambda <= 0.0) lambda = 1e-10; // guard
+        if (lambda <= 0.0) lambda = 1e-10;
 
-        if (@abs(delta) < 1e-8 * lambda) break;
+        if (@abs(delta) < 1e-8 * lambda) {
+            converged = true;
+            break;
+        }
+    }
+
+    // Bisection fallback if Newton-Raphson did not converge.
+    if (!converged) {
+        var lo: f64 = 1e-10;
+        var hi: f64 = lambda * 10.0;
+        if (hi < 1.0) hi = 1.0;
+        for (0..200) |_| {
+            const mid = (lo + hi) / 2.0;
+            var s0f: f64 = 0.0;
+            var s1f: f64 = 0.0;
+            for (x) |xi| {
+                const e = @exp(-mid * (xi - x_max));
+                s0f += e;
+                s1f += xi * e;
+            }
+            const f_val = (1.0 / mid) + s1f / s0f - mean;
+            if (f_val > 0) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+            if ((hi - lo) < 1e-8 * lo) break;
+        }
+        lambda = (lo + hi) / 2.0;
     }
 
     // Derive mu from the MLE relationship:
