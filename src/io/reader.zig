@@ -8,6 +8,10 @@ const fasta = @import("fasta.zig");
 const stockholm = @import("stockholm.zig");
 const genbank = @import("genbank.zig");
 const clustal = @import("clustal.zig");
+const phylip = @import("phylip.zig");
+const a2m = @import("a2m.zig");
+const psiblast = @import("psiblast.zig");
+const selex = @import("selex.zig");
 
 pub const Format = enum {
     fasta,
@@ -20,6 +24,17 @@ pub const Format = enum {
     /// have the same length including gap columns. Cannot be auto-detected;
     /// must be specified explicitly.
     afa,
+    /// PHYLIP interleaved format.
+    phylip,
+    /// A2M (aligned FASTA with insert annotation via case).
+    /// Cannot be auto-detected (looks like FASTA); must be specified explicitly.
+    a2m,
+    /// PSI-BLAST flat text alignment format.
+    /// Cannot be auto-detected; must be specified explicitly.
+    psiblast,
+    /// SELEX (old alignment format from Sean Eddy).
+    /// Cannot be auto-detected; must be specified explicitly.
+    selex,
 
     /// Detect format from the first non-whitespace bytes of data.
     pub fn detect(header: []const u8) ?Format {
@@ -35,7 +50,27 @@ pub const Format = enum {
         // EMBL/UniProt: two-letter tag "ID" followed by exactly 3 spaces
         if (std.mem.startsWith(u8, rest, "ID   ")) return .embl;
         if (std.mem.startsWith(u8, rest, "CLUSTAL")) return .clustal;
+        // CLUSTAL-like: MUSCLE, PROBCONS etc. output with "multiple sequence alignment"
+        if (std.mem.indexOf(u8, rest[0..@min(rest.len, 80)], "multiple sequence alignment") != null) return .clustal;
+        // PHYLIP: first non-whitespace content is two integers (nseq alen)
+        if (detectPhylip(rest)) return .phylip;
         return null;
+    }
+
+    fn detectPhylip(data: []const u8) bool {
+        // PHYLIP starts with two whitespace-separated integers on the first line
+        var it = std.mem.tokenizeAny(u8, data, " \t");
+        const tok1 = it.next() orelse return false;
+        // First token must end before newline and be all digits
+        for (tok1) |c| {
+            if (c < '0' or c > '9') return false;
+        }
+        const tok2 = it.next() orelse return false;
+        for (tok2) |c| {
+            if (c == '\n' or c == '\r') break;
+            if (c < '0' or c > '9') return false;
+        }
+        return true;
     }
 };
 
@@ -101,6 +136,10 @@ pub const Reader = struct {
             .embl => return try nextEmbl(self),
             .clustal => return try nextClustal(self),
             .afa => return try nextAfa(self),
+            .phylip => return try nextPhylip(self),
+            .a2m => return try nextA2m(self),
+            .psiblast => return try nextPsiblast(self),
+            .selex => return try nextSelex(self),
         }
     }
 
@@ -234,8 +273,24 @@ pub const Reader = struct {
     }
 
     fn nextAfa(self: *Reader) !?Sequence {
-        const afa = @import("afa.zig");
-        return self.nextMsaFormat(afa.parse);
+        const afa_mod = @import("afa.zig");
+        return self.nextMsaFormat(afa_mod.parse);
+    }
+
+    fn nextPhylip(self: *Reader) !?Sequence {
+        return self.nextMsaFormat(phylip.parse);
+    }
+
+    fn nextA2m(self: *Reader) !?Sequence {
+        return self.nextMsaFormat(a2m.parse);
+    }
+
+    fn nextPsiblast(self: *Reader) !?Sequence {
+        return self.nextMsaFormat(psiblast.parse);
+    }
+
+    fn nextSelex(self: *Reader) !?Sequence {
+        return self.nextMsaFormat(selex.parse);
     }
 
     pub fn deinit(self: *Reader) void {
