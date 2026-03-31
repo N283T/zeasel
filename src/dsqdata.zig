@@ -113,6 +113,124 @@ pub fn readAll(allocator: Allocator, src: std.io.AnyReader, abc: *const Alphabet
     return seqs.toOwnedSlice(allocator);
 }
 
+// --- Threaded prefetch reader ---
+
+const SequenceBlock = @import("sequence.zig").SequenceBlock;
+const WorkQueue = @import("threads.zig").WorkQueue;
+
+/// A threaded dsqdata reader that prefetches sequence blocks in a background
+/// loader thread, handing them to the main thread via a work queue.
+/// Must be heap-allocated (use create/destroy) because the loader thread
+/// holds a pointer to the queue.
+pub const PrefetchReader = struct {
+    queue: WorkQueue(*SequenceBlock),
+    loader: ?std.Thread,
+    allocator: Allocator,
+
+    /// Create a PrefetchReader on the heap and spawn the loader thread.
+    /// The header must already have been read from src.
+    /// Caller must call destroy() when done.
+    pub fn create(allocator: Allocator, src: std.io.AnyReader, abc: *const Alphabet, block_size: usize) !*PrefetchReader {
+        const self = try allocator.create(PrefetchReader);
+        errdefer allocator.destroy(self);
+
+        self.* = PrefetchReader{
+            .queue = WorkQueue(*SequenceBlock).init(allocator),
+            .loader = null,
+            .allocator = allocator,
+        };
+
+        const ctx = try allocator.create(LoaderCtx);
+        errdefer allocator.destroy(ctx);
+        ctx.* = LoaderCtx{
+            .reader = src,
+            .queue = &self.queue,
+            .allocator = allocator,
+            .abc = abc,
+            .block_size = block_size,
+        };
+
+        self.loader = try std.Thread.spawn(.{}, loaderThread, .{ctx});
+        return self;
+    }
+
+    /// Read the next block of sequences. Returns null when all sequences
+    /// have been read. Caller should call recycle() on each returned block.
+    pub fn read(self: *PrefetchReader) ?*SequenceBlock {
+        return self.queue.receive();
+    }
+
+    /// Recycle a used block by freeing its sequences and the block itself.
+    pub fn recycle(self: *PrefetchReader, block: *SequenceBlock) void {
+        block.deinit();
+        self.allocator.destroy(block);
+    }
+
+    /// Destroy the reader, waiting for the loader thread to finish.
+    pub fn destroy(self: *PrefetchReader) void {
+        if (self.loader) |t| t.join();
+        self.queue.deinit();
+        self.allocator.destroy(self);
+    }
+
+    const LoaderCtx = struct {
+        reader: std.io.AnyReader,
+        queue: *WorkQueue(*SequenceBlock),
+        allocator: Allocator,
+        abc: *const Alphabet,
+        block_size: usize,
+    };
+
+    fn loaderThread(ctx: *LoaderCtx) void {
+        const alloc = ctx.allocator;
+        const q = ctx.queue;
+        const abc = ctx.abc;
+        const bs = ctx.block_size;
+        const rdr = ctx.reader;
+        alloc.destroy(ctx);
+
+        while (true) {
+            const block = alloc.create(SequenceBlock) catch {
+                q.close();
+                return;
+            };
+            block.* = SequenceBlock.initCapacity(alloc, bs) catch {
+                alloc.destroy(block);
+                q.close();
+                return;
+            };
+
+            var count: usize = 0;
+            while (count < bs) {
+                const seq = readNext(alloc, rdr, abc) catch break;
+                if (seq) |s| {
+                    block.add(s) catch break;
+                    count += 1;
+                } else break;
+            }
+
+            if (count == 0) {
+                block.deinit();
+                alloc.destroy(block);
+                q.close();
+                return;
+            }
+
+            q.send(block) catch {
+                block.deinit();
+                alloc.destroy(block);
+                q.close();
+                return;
+            };
+
+            if (count < bs) {
+                q.close();
+                return;
+            }
+        }
+    }
+};
+
 // --- Tests ---
 
 test "write and readAll: round trip with 3 DNA sequences" {
@@ -230,4 +348,39 @@ test "round trip with amino acid sequences" {
     try std.testing.expectEqual(@as(usize, 1), result.len);
     try std.testing.expectEqualStrings("myprot", result[0].name);
     try std.testing.expectEqualSlices(u8, seq.dsq, result[0].dsq);
+}
+
+test "PrefetchReader: threaded read of 5 sequences in blocks of 2" {
+    const allocator = std.testing.allocator;
+
+    // Write 5 sequences
+    var seqs_arr: [5]Sequence = undefined;
+    var to_free: usize = 0;
+    defer for (0..to_free) |i| seqs_arr[i].deinit();
+
+    for (0..5) |i| {
+        var name_buf: [8]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "s{d}", .{i}) catch unreachable;
+        seqs_arr[i] = try Sequence.fromText(allocator, &alphabet_mod.dna, name, "ACGTACGT");
+        to_free = i + 1;
+    }
+
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(allocator);
+    try write(buf.writer(allocator).any(), &alphabet_mod.dna, &seqs_arr);
+
+    // Read with prefetch (heap-allocated PrefetchReader)
+    var fbs = std.io.fixedBufferStream(buf.items);
+    _ = try readHeader(fbs.reader().any());
+
+    const reader = try PrefetchReader.create(allocator, fbs.reader().any(), &alphabet_mod.dna, 2);
+    defer reader.destroy();
+
+    var total_seqs: usize = 0;
+    while (reader.read()) |block| {
+        defer reader.recycle(block);
+        total_seqs += block.count;
+    }
+
+    try std.testing.expectEqual(@as(usize, 5), total_seqs);
 }
