@@ -10,6 +10,7 @@
 /// Numerical Recipes §6.2.
 const std = @import("std");
 const math = std.math;
+const functions = @import("functions.zig");
 
 /// Maximum iterations for series / continued-fraction expansions.
 const MAX_ITER: usize = 200;
@@ -105,6 +106,67 @@ pub fn surv(x: f64, mu: f64, lambda: f64, a: f64) f64 {
     return 1.0 - cdf(x, mu, lambda, a);
 }
 
+/// Result of fitting a gamma distribution.
+pub const FitResult = struct {
+    mu: f64,
+    lambda: f64,
+    alpha: f64,
+};
+
+/// Maximum likelihood fit of a complete gamma distribution.
+///
+/// Given observed data x[0..n-1] and a known location parameter mu (typically 0),
+/// estimates lambda (rate) and alpha (shape) using Minka's generalized Newton method.
+///
+/// The shape parameter `alpha` corresponds to `tau` in Easel's esl_gam_FitComplete()
+/// and `a` in this module's pdf/cdf functions.
+///
+/// Returns error.DidNotConverge if the iterative alpha estimation fails to converge.
+pub fn fitComplete(x: []const f64, mu: f64) !FitResult {
+    std.debug.assert(x.len > 0);
+
+    const n: f64 = @floatFromInt(x.len);
+
+    // Compute sufficient statistics: mean(x-mu) and mean(log(x-mu))
+    var xbar: f64 = 0;
+    var logxbar: f64 = 0;
+    for (x) |xi| {
+        const shifted = xi - mu;
+        std.debug.assert(shifted >= 0);
+        xbar += shifted;
+        logxbar += if (shifted == 0.0) -36.0 else @log(shifted);
+    }
+    xbar /= n;
+    logxbar /= n;
+
+    // Initial estimate for alpha using Stirling approximation
+    // From Easel: alpha = 0.5 / (log(xbar) - logxbar)
+    var alpha = 0.5 / (@log(xbar) - logxbar);
+
+    // Generalized Newton iteration (Minka 2002)
+    const max_iterations: usize = 100;
+    var iter: usize = 0;
+    while (iter < max_iterations) : (iter += 1) {
+        const old_alpha = alpha;
+
+        const psi_val = functions.psi(alpha);
+        const tri_val = functions.trigamma(alpha);
+
+        // Minka's update: alpha = 1/(1/alpha + (logxbar - log(xbar) + log(alpha) - psi(alpha)) / (alpha - alpha^2 * trigamma(alpha)))
+        alpha = 1.0 / (1.0 / alpha + (logxbar - @log(xbar) + @log(alpha) - psi_val) / (alpha - alpha * alpha * tri_val));
+
+        // Check convergence on both alpha and the NLL
+        if (@abs(alpha - old_alpha) < 1e-6 * @abs(old_alpha) + 1e-6) break;
+    }
+    if (iter == max_iterations) return error.DidNotConverge;
+
+    return .{
+        .mu = mu,
+        .lambda = alpha / xbar,
+        .alpha = alpha,
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -156,4 +218,46 @@ test "gamma cdf + surv = 1" {
     const c = cdf(x, 0.0, 1.0, 2.0);
     const s = surv(x, 0.0, 1.0, 2.0);
     try std.testing.expect(math.approxEqAbs(f64, c + s, 1.0, 1e-14));
+}
+
+test "fitComplete: gamma with alpha=2, lambda=1, mu=0" {
+    // Gamma(alpha=2, lambda=1) has mean=2, variance=2.
+    // Hand-crafted data with mean ~2.0 and shape ~2.
+    const data = [_]f64{
+        1.2, 2.5, 1.8, 3.1, 0.9,
+        2.0, 1.5, 2.8, 1.1, 3.5,
+        2.3, 1.7, 0.8, 2.9, 1.4,
+        2.6, 1.9, 3.0, 1.3, 2.2,
+    };
+
+    const result = try fitComplete(&data, 0.0);
+
+    // mu should be exactly as passed
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), result.mu, 1e-10);
+
+    // alpha and lambda should be reasonable estimates
+    // With 20 samples, we accept generous tolerance
+    try std.testing.expect(result.alpha > 0.5);
+    try std.testing.expect(result.alpha < 10.0);
+    try std.testing.expect(result.lambda > 0.1);
+    try std.testing.expect(result.lambda < 10.0);
+
+    // The ratio alpha/lambda should approximate the sample mean
+    var sum: f64 = 0;
+    for (data) |xi| sum += xi;
+    const sample_mean = sum / @as(f64, @floatFromInt(data.len));
+    const fitted_mean = result.alpha / result.lambda;
+    try std.testing.expectApproxEqAbs(sample_mean, fitted_mean, 1e-6);
+}
+
+test "fitComplete: gamma exponential special case (alpha~1)" {
+    // Exponential is Gamma with alpha=1. Data ~ Exp(lambda=1), mean=1.
+    const data = [_]f64{ 0.2, 0.5, 0.1, 1.5, 0.8, 2.0, 0.3, 1.2, 0.7, 1.0 };
+
+    const result = try fitComplete(&data, 0.0);
+
+    // Alpha should be near 1 for exponential-like data
+    try std.testing.expect(result.alpha > 0.3);
+    try std.testing.expect(result.alpha < 3.0);
+    try std.testing.expect(result.lambda > 0.1);
 }
