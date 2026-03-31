@@ -6,6 +6,18 @@ const alphabet_mod = @import("alphabet.zig");
 const Alphabet = alphabet_mod.Alphabet;
 const Sequence = @import("sequence.zig").Sequence;
 
+/// A single #=GF line: per-file annotation tag and value.
+pub const GfEntry = struct { tag: []const u8, value: []const u8 };
+
+/// A single #=GC line: per-column annotation tag and annotation string.
+pub const GcEntry = struct { tag: []const u8, annotation: []const u8 };
+
+/// A single #=GS line: per-sequence annotation (seq name, tag, value).
+pub const GsEntry = struct { seq_name: []const u8, tag: []const u8, value: []const u8 };
+
+/// A single #=GR line: per-residue annotation (seq name, tag, annotation string).
+pub const GrEntry = struct { seq_name: []const u8, tag: []const u8, annotation: []const u8 };
+
 pub const Msa = struct {
     names: [][]const u8, // Sequence names [nseq], each is allocator-owned
     seqs: [][]u8, // Digital sequences [nseq][alen], each row is allocator-owned
@@ -18,6 +30,16 @@ pub const Msa = struct {
     accession: ?[]const u8 = null,
     description: ?[]const u8 = null,
     weights: ?[]f64 = null,
+
+    // Per-column consensus annotations (allocator-owned if non-null)
+    consensus_ss: ?[]const u8 = null, // #=GC SS_cons
+    reference: ?[]const u8 = null, // #=GC RF
+
+    // Generic markup storage for round-trip fidelity (allocator-owned if non-null)
+    gf_markup: ?[]GfEntry = null, // all #=GF lines
+    gc_markup: ?[]GcEntry = null, // all #=GC lines (including SS_cons/RF)
+    gs_markup: ?[]GsEntry = null, // all #=GS lines
+    gr_markup: ?[]GrEntry = null, // all #=GR lines
 
     pub fn nseq(self: Msa) usize {
         return self.names.len;
@@ -170,6 +192,38 @@ pub const Msa = struct {
         if (self.accession) |a| self.allocator.free(a);
         if (self.description) |d| self.allocator.free(d);
         if (self.weights) |w| self.allocator.free(w);
+        if (self.consensus_ss) |ss| self.allocator.free(ss);
+        if (self.reference) |rf| self.allocator.free(rf);
+        if (self.gf_markup) |entries| {
+            for (entries) |e| {
+                self.allocator.free(e.tag);
+                self.allocator.free(e.value);
+            }
+            self.allocator.free(entries);
+        }
+        if (self.gc_markup) |entries| {
+            for (entries) |e| {
+                self.allocator.free(e.tag);
+                self.allocator.free(e.annotation);
+            }
+            self.allocator.free(entries);
+        }
+        if (self.gs_markup) |entries| {
+            for (entries) |e| {
+                self.allocator.free(e.seq_name);
+                self.allocator.free(e.tag);
+                self.allocator.free(e.value);
+            }
+            self.allocator.free(entries);
+        }
+        if (self.gr_markup) |entries| {
+            for (entries) |e| {
+                self.allocator.free(e.seq_name);
+                self.allocator.free(e.tag);
+                self.allocator.free(e.annotation);
+            }
+            self.allocator.free(entries);
+        }
     }
 };
 
