@@ -6,18 +6,23 @@ const Msa = @import("msa.zig").Msa;
 const Alphabet = @import("alphabet.zig").Alphabet;
 
 /// Percent identity between two aligned digital sequences.
-/// Gaps in either sequence are excluded from comparison.
+/// Uses Easel's definition: denominator is MIN(len1, len2) where
+/// len1/len2 are the number of non-gap residues in each sequence.
+/// This matches esl_dst_XPairId() used by HMMER.
 pub fn percentIdentity(abc: *const Alphabet, seq1: []const u8, seq2: []const u8) f64 {
     var matches: u32 = 0;
-    var compared: u32 = 0;
+    var len1: u32 = 0;
+    var len2: u32 = 0;
     for (seq1, seq2) |a, b| {
-        if (!abc.isGap(a) and !abc.isGap(b)) {
-            compared += 1;
-            if (a == b) matches += 1;
-        }
+        const a_res = !abc.isGap(a);
+        const b_res = !abc.isGap(b);
+        if (a_res) len1 += 1;
+        if (b_res) len2 += 1;
+        if (a_res and b_res and a == b) matches += 1;
     }
-    if (compared == 0) return 0.0;
-    return @as(f64, @floatFromInt(matches)) / @as(f64, @floatFromInt(compared));
+    const denom = @min(len1, len2);
+    if (denom == 0) return 0.0;
+    return @as(f64, @floatFromInt(matches)) / @as(f64, @floatFromInt(denom));
 }
 
 /// Generalized Jukes-Cantor distance correction:
@@ -86,18 +91,17 @@ test "percentIdentity: completely different sequences returns 0.0" {
     try std.testing.expectApproxEqAbs(@as(f64, 0.0), pid, 1e-10);
 }
 
-test "percentIdentity: gaps are excluded from comparison" {
+test "percentIdentity: uses MIN(len1,len2) denominator" {
     const abc = &@import("alphabet.zig").dna;
-    // gap code for DNA is abc.k = 4
-    // seq1: A A - A  (positions 0,1,3 compared; position 2 is gap in seq2)
-    // seq2: A A A -  (position 3 is gap in seq2, position 2 is gap in seq1)
-    // Both have gaps at different places: positions 2 and 3 each have one gap.
-    // Positions 0 and 1 are comparable: A==A and A==A -> 2 matches / 2 compared = 1.0
+    // seq1: A A - A  (len1=3)
+    // seq2: A A A -  (len2=3)
+    // matches at cols 0,1 = 2 (col 2: seq1 has gap; col 3: seq2 has gap)
+    // pid = 2 / MIN(3,3) = 2/3
     const gap: u8 = 4;
     const seq1 = &[_]u8{ 0, 0, gap, 0 };
     const seq2 = &[_]u8{ 0, 0, 0, gap };
     const pid = percentIdentity(abc, seq1, seq2);
-    try std.testing.expectApproxEqAbs(@as(f64, 1.0), pid, 1e-10);
+    try std.testing.expectApproxEqAbs(2.0 / 3.0, pid, 1e-10);
 }
 
 test "percentIdentity: all gaps returns 0.0" {

@@ -116,19 +116,23 @@ pub fn blosum(allocator: Allocator, m: Msa, id_threshold: f64) ![]f64 {
 /// Compute percent identity between two aligned sequences.
 /// Positions where either sequence has a gap are excluded from the comparison.
 /// Returns 0.0 if there are no comparable (ungapped) positions.
+/// Pairwise identity using Easel's definition: MIN(len1, len2) denominator.
 pub fn pairwiseIdentity(m: Msa, i: usize, j: usize) f64 {
     var matches: u32 = 0;
-    var compared: u32 = 0;
+    var len1: u32 = 0;
+    var len2: u32 = 0;
     for (0..m.alen) |col| {
         const a = m.seqs[i][col];
         const b = m.seqs[j][col];
-        if (!m.abc.isGap(a) and !m.abc.isGap(b)) {
-            compared += 1;
-            if (a == b) matches += 1;
-        }
+        const a_res = !m.abc.isGap(a);
+        const b_res = !m.abc.isGap(b);
+        if (a_res) len1 += 1;
+        if (b_res) len2 += 1;
+        if (a_res and b_res and a == b) matches += 1;
     }
-    if (compared == 0) return 0.0;
-    return @as(f64, @floatFromInt(matches)) / @as(f64, @floatFromInt(compared));
+    const denom = @min(len1, len2);
+    if (denom == 0) return 0.0;
+    return @as(f64, @floatFromInt(matches)) / @as(f64, @floatFromInt(denom));
 }
 
 // --- Union-Find helpers ---
