@@ -4,23 +4,25 @@ A Zig reimplementation of [Easel](https://github.com/EddyRivasLab/easel), the C 
 
 ## Features
 
-- **Biological alphabets** — DNA, RNA, amino acid with comptime lookup tables, degeneracy resolution, scoring/counting
-- **Sequence I/O** — FASTA, Stockholm, GenBank, EMBL, Clustal, aligned FASTA, PHYLIP, A2M, PSI-BLAST, SELEX
-- **Multiple sequence alignment** — MSA operations, weighting (PB/BLOSUM), clustering, gap manipulation, metadata
-- **SIMD vector operations** — comptime-generic `@Vector`-based ops with automatic ISA selection
-- **Statistical distributions** — Gumbel, gamma, exponential, normal, Weibull, Dirichlet, mixture Dirichlet
-- **Statistical functions** — logGamma, digamma, chi-squared test, G-test, linear regression
-- **Numerical optimization** — minimizer (conjugate gradient), root finder (Brent's method)
-- **Score matrices** — BLOSUM45/62/80, PAM30/70/120/250 with named lookup and probability analysis
-- **Evolutionary models** — rate matrix Q, probability matrix P=exp(tQ), PAML model reader
-- **Genetic code** — codon translation with NCBI genetic code tables
-- **Sequence distance** — pairwise identity and Jukes-Cantor correction
-- **Phylogenetic trees** — UPGMA, single/complete linkage, WPGMA, Newick read/write
-- **SSI index** — sequence/subsequence index with aliases, multi-file, subseq positioning
-- **dsqdata** — binary packed sequence database with threaded prefetch reader
-- **Threading** — thread pool, work queue (producer-consumer), CPU detection
-- **Data structures** — red-black tree, Huffman coding, varint encoding, bipartite matching
-- **WUSS notation** — RNA secondary structure parsing and validation
+- **Biological alphabets** — DNA, RNA, amino acid with comptime lookup tables, degeneracy resolution, scoring/counting, robust alphabet guessing
+- **Sequence I/O** — FASTA, Stockholm (multi-MSA), GenBank, EMBL, DDBJ, Clustal, aligned FASTA, PHYLIP (interleaved+sequential), A2M, PSI-BLAST, SELEX, Pfam; gzip auto-decompression, stdin support, SSI random-access fetch
+- **Streaming I/O** — `WindowReader` for chromosome-scale sequences with overlapping windows
+- **Multiple sequence alignment** — MSA operations, weighting (PB/BLOSUM/GSC), clustering, gap manipulation, bootstrap resampling, vertical shuffle, FlushLeftInserts, identity filtering (IDFilter), broken base-pair repair
+- **SIMD vector operations** — comptime-generic `@Vector`-based ops with automatic ISA selection; logNorm, relativeEntropy, sort, validate, log/exp
+- **Statistical distributions** — Gumbel, gamma, exponential, normal, Weibull, Dirichlet, mixture Dirichlet; full PDF/CDF/surv/logPdf/logCdf/logSurv/invcdf; MLE fitting for all distributions; censored/truncated Gumbel fitting
+- **Statistical functions** — logGamma, digamma, chi-squared test, G-test, linear regression, high-precision erfc (C library)
+- **Numerical optimization** — conjugate gradient minimizer with bracket+Brent line search, Brent's root finder
+- **Score matrices** — BLOSUM45/62/80, PAM30/70/120/250; i16 scores with Kp×Kp degenerate residue support; BLAST format I/O; named lookup, probability analysis
+- **Evolutionary models** — rate matrix Q with JukesCantor/Kimura/WAG constructors, probability matrix P=exp(tQ), PAML reader with alphabet permutation, mixture Dirichlet I/O
+- **Genetic code** — all 18 NCBI translation tables, ambiguity-aware codon translation, ORF finding pipeline (6-frame)
+- **Sequence distance** — pairwise identity (MIN denominator), generalized Jukes-Cantor (any K), Kimura, variance estimation, average pairwise identity with subsampling
+- **Phylogenetic trees** — UPGMA, single/complete linkage, WPGMA, Newick read/write (multifurcation detection), tree compare/validate, random tree simulation
+- **SSI index** — sequence/subsequence index with aliases, multi-file, subseq positioning, Reader fetch integration
+- **dsqdata** — binary packed sequence database with threaded prefetch reader, DualWorkQueue buffer recycling
+- **Threading** — thread pool with start barrier and per-worker data, WorkQueue (O(1) circular buffer), DualWorkQueue (reader/worker pattern), runtime CPU detection (CPUID/NEON)
+- **Data structures** — red-black tree (with sorted slice export), Huffman coding (encode/decode), varint (Google + exp-Golomb + Rice), bipartite matching, independent set splitting (Cobalt/Blue algorithms)
+- **Matrix** — dense matrix with LU decomposition, inverse, exp(tQ), Jacobi eigenvalue decomposition
+- **WUSS notation** — RNA secondary structure parsing, validation, pseudoknot removal, reverse complement
 
 ## Requirements
 
@@ -81,7 +83,7 @@ src/
 ├── sequence.zig         # Sequence type + SequenceBlock
 ├── io.zig               # I/O module hub
 │   └── io/              # Format-specific parsers/writers
-│       ├── reader.zig, writer.zig
+│       ├── reader.zig, writer.zig, window_reader.zig
 │       ├── fasta.zig, stockholm.zig, genbank.zig
 │       ├── clustal.zig, afa.zig, phylip.zig
 │       ├── a2m.zig, psiblast.zig, selex.zig
@@ -131,48 +133,48 @@ Full comparison of Easel's C modules and their zeasel status.
 | `esl_alphabet` | `alphabet.zig` | Comptime alphabets + degeneracy tables, scoring/counting functions |
 | `esl_sq` | `sequence.zig` | Digital sequences + SequenceBlock for threaded pipelines |
 | `esl_msa` | `msa.zig` | Full MSA operations: subset, gaps, RC, metadata, validation |
-| `esl_msaweight` | `msa_weight.zig` | PB weights, BLOSUM weights |
+| `esl_msaweight` | `msa_weight.zig` | PB weights (consensus columns, per-seq normalization), BLOSUM weights, GSC weights, IDFilter |
 | `esl_msacluster` | `msa_ops.zig` | Single-linkage clustering by % identity |
-| `esl_msashuffle` | `msa_ops.zig` | Column shuffling (Fisher-Yates) |
-| `esl_scorematrix` | `score_matrix.zig` | BLOSUM45/62/80, PAM30/70/120/250, named lookup, entropy |
+| `esl_msashuffle` | `msa_ops.zig` | Column/vertical shuffling, bootstrap resampling, FlushLeftInserts, broken base-pair repair |
+| `esl_scorematrix` | `score_matrix.zig` | BLOSUM45/62/80, PAM30/70/120/250; i16 Kp×Kp with degenerate support; BLAST format I/O |
 | `esl_composition` | `composition.zig` | BL62, WAG, SW34, SW50 background frequencies |
-| `esl_distance` | `distance.zig` | Pairwise identity, Jukes-Cantor correction |
-| `esl_tree` | `tree.zig` | UPGMA, single/complete linkage, WPGMA, Newick read/write |
-| `esl_dmatrix` | `matrix.zig` | Dense matrix + LU decomposition, inverse, exp(tQ) |
+| `esl_distance` | `distance.zig` | Pairwise identity (MIN denominator), generalized JC, Kimura, variance, average identity |
+| `esl_tree` | `tree.zig` | UPGMA, single/complete/WPGMA, Newick I/O, compare, validate, simulate |
+| `esl_dmatrix` | `matrix.zig` | Dense matrix + LU decomposition, inverse, exp(tQ), Jacobi eigenvalue decomposition |
 | `esl_ssi` | `ssi.zig` | SSI index with aliases, multi-file, subseq positioning |
 | `esl_dsqdata` | `dsqdata.zig` | Binary sequence DB + threaded PrefetchReader |
-| `esl_gencode` | `gencode.zig` | NCBI genetic code tables, codon translation |
-| `esl_wuss` | `wuss.zig` | RNA secondary structure WUSS notation |
+| `esl_gencode` | `gencode.zig` | All 18 NCBI tables, ambiguity-aware translation, ORF finding pipeline |
+| `esl_wuss` | `wuss.zig` | WUSS notation: parse, validate, noPseudo, reverse |
 | `esl_cluster` | `cluster.zig` | Generalized single-linkage clustering |
-| `esl_vectorops` | `simd/vector_ops.zig` | Comptime-generic SIMD via `@Vector` |
-| `esl_gumbel` | `stats/gumbel.zig` | Gumbel distribution (E-value core) |
-| `esl_exponential` | `stats/exponential.zig` | Exponential distribution |
-| `esl_gamma` | `stats/gamma.zig` | Gamma distribution + incomplete gamma |
-| `esl_normal` | `stats/normal.zig` | Normal distribution |
-| `esl_weibull` | `stats/weibull.zig` | Weibull distribution |
-| `esl_dirichlet` | `stats/dirichlet.zig` | Dirichlet distribution |
-| `esl_histogram` | `stats/histogram.zig` | Histogram binning |
-| `esl_minimizer` | `stats/minimizer.zig` | Conjugate gradient minimizer |
+| `esl_vectorops` | `simd/vector_ops.zig` | Comptime-generic SIMD; logNorm, relativeEntropy, sort, validate |
+| `esl_gumbel` | `stats/gumbel.zig` | Full PDF/CDF/surv/log-space; complete + censored MLE fitting |
+| `esl_exponential` | `stats/exponential.zig` | Full PDF/CDF/surv/log-space; MLE fitting |
+| `esl_gamma` | `stats/gamma.zig` | Full PDF/CDF/surv/log-space/invcdf; Minka MLE fitting |
+| `esl_normal` | `stats/normal.zig` | High-precision erfc-based CDF/surv |
+| `esl_weibull` | `stats/weibull.zig` | Full PDF/CDF/surv/log-space; CG minimizer MLE fitting |
+| `esl_dirichlet` | `stats/dirichlet.zig` | Dirichlet distribution + sampling |
+| `esl_histogram` | `stats/histogram.zig` | Dynamic resizing, tail fitting, goodness-of-fit |
+| `esl_minimizer` | `stats/minimizer.zig` | Conjugate gradient with bracket+Brent line search |
 | `esl_rootfinder` | `stats/rootfinder.zig` | Brent's method root finder |
 | `esl_stats` | `stats/functions.zig` | logGamma, psi, trigamma, erfc, chi-squared, G-test, linear regression |
-| `esl_mixdchlet` | `mixdchlet.zig` | Mixture Dirichlet priors for hmmbuild |
-| `esl_ratematrix` | `ratematrix.zig` | Rate matrix Q, P=exp(tQ), normalization |
-| `esl_paml` | `paml.zig` | PAML exchangeability matrix reader |
+| `esl_mixdchlet` | `mixdchlet.zig` | Mixture Dirichlet priors; Read/Write I/O, validate, compare |
+| `esl_ratematrix` | `ratematrix.zig` | Rate matrix Q with JC/Kimura/WAG constructors, P=exp(tQ), validation |
+| `esl_paml` | `paml.zig` | PAML reader with PAML→zeasel alphabet permutation |
 | `esl_red_black` | `red_black.zig` | Red-black tree (HMMER sparse DP) |
-| `esl_huffman` | `huffman.zig` | Huffman coding for compressed sequences |
-| `esl_varint` | `varint.zig` | Google varint (base-128) encoding |
+| `esl_huffman` | `huffman.zig` | Huffman coding with encode/decode operations |
+| `esl_varint` | `varint.zig` | Google varint, exponential-Golomb, Golomb-Rice encoding |
 | `esl_graph` | `graph.zig` | Maximum bipartite matching |
-| `esl_iset` | `iset.zig` | Independent set splitting (training/test) |
-| `esl_recorder` | `recorder.zig` | Line-based I/O with rewind/replay |
-| `esl_cpu` | `cpu.zig` | SIMD feature detection, CPU core count |
-| `esl_threads` | `threads.zig` | Thread pool + WorkQueue |
-| `esl_random` | `util/random.zig` | Mersenne Twister RNG |
-| `esl_randomseq` | `util/random_seq.zig` | Random sequence generation |
+| `esl_iset` | `iset.zig` | Cobalt/Blue independent set splitting (Petti & Eddy 2022) |
+| `esl_recorder` | `recorder.zig` | Line-based I/O with rewind/replay, stream integration, block marking |
+| `esl_cpu` | `cpu.zig` | Comptime + runtime (CPUID/NEON) feature detection |
+| `esl_threads` | `threads.zig` | ThreadPool with start barrier, WorkQueue (circular), DualWorkQueue |
+| `esl_random` | `util/random.zig` | Mersenne Twister RNG + gamma deviate + uniformPositive |
+| `esl_randomseq` | `util/random_seq.zig` | Random sequence generation, Altschul-Erickson dinucleotide shuffle |
 | `esl_sqio_ascii` | `io/fasta.zig` | FASTA/EMBL sequence I/O |
 | `esl_msafile_stockholm` | `io/stockholm.zig` | Stockholm format |
 | `esl_msafile_clustal` | `io/clustal.zig` | Clustal format |
 | `esl_msafile_afa` | `io/afa.zig` | Aligned FASTA |
-| `esl_msafile_phylip` | `io/phylip.zig` | PHYLIP interleaved/sequential |
+| `esl_msafile_phylip` | `io/phylip.zig` | PHYLIP interleaved + sequential auto-detection |
 | `esl_msafile_a2m` | `io/a2m.zig` | A2M (UCSC SAM) format |
 | `esl_msafile_psiblast` | `io/psiblast.zig` | PSI-BLAST format |
 | `esl_msafile_selex` | `io/selex.zig` | SELEX format |
