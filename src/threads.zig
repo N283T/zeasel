@@ -1,49 +1,163 @@
 // Threading infrastructure for parallel pipelines.
 //
-// Provides a thread pool (master/worker model), a work queue
-// (producer-consumer mailbox pattern), and a dual work queue
-// (reader/worker buffer-recycling pattern) for HMMER-style parallel search.
+// Provides a start barrier (master/worker synchronization), a thread pool
+// (master/worker model), a work queue (producer-consumer mailbox pattern),
+// and a dual work queue (reader/worker buffer-recycling pattern) for
+// HMMER-style parallel search.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-/// A simple thread pool that manages a fixed number of worker threads.
-pub fn ThreadPool(comptime Context: type) type {
+/// Master/worker start synchronization barrier, modeled after Easel's
+/// ESL_THREADS start protocol (esl_threads_WaitForStart / esl_threads_Started).
+///
+/// Workers call `started()` to signal readiness, then block until the master
+/// calls `waitForStart()`. This guarantees all workers are initialized before
+/// any work begins.
+pub const StartBarrier = struct {
+    mutex: std.Thread.Mutex,
+    cond: std.Thread.Condition,
+    started_count: usize,
+    n_workers: usize,
+    go_signal: bool,
+
+    pub fn init(n_workers: usize) StartBarrier {
+        return .{
+            .mutex = .{},
+            .cond = .{},
+            .started_count = 0,
+            .n_workers = n_workers,
+            .go_signal = false,
+        };
+    }
+
+    /// Block the master thread until all workers have called `started()`,
+    /// then release them all to begin work.
+    pub fn waitForStart(self: *StartBarrier) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        while (self.started_count < self.n_workers) {
+            self.cond.wait(&self.mutex);
+        }
+
+        // All workers are ready; release them.
+        self.go_signal = true;
+        self.cond.broadcast();
+    }
+
+    /// Called by a worker thread to signal that it has initialized and is
+    /// ready to begin work. Blocks until the master calls `waitForStart()`.
+    pub fn started(self: *StartBarrier) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.started_count += 1;
+        self.cond.broadcast();
+
+        // Wait for the master's go signal.
+        while (!self.go_signal) {
+            self.cond.wait(&self.mutex);
+        }
+    }
+};
+
+/// Per-worker argument bundle passed to the worker function.
+/// Contains a unique worker index, the shared context, and a pointer
+/// to the start barrier for synchronization.
+pub fn WorkerInfo(comptime Context: type) type {
+    return struct {
+        worker_index: usize,
+        context: Context,
+        barrier: *StartBarrier,
+    };
+}
+
+/// A thread pool that manages a fixed number of worker threads with
+/// master/worker start synchronization, modeled after Easel's ESL_THREADS.
+///
+/// Workers receive a `WorkerInfo` containing a unique index (0..n_workers-1),
+/// a shared context, and a pointer to a `StartBarrier`. Workers should call
+/// `info.barrier.started()` early in their execution; the master calls
+/// `pool.waitForStart()` to block until all workers are ready, then
+/// releases them all simultaneously.
+pub fn ThreadPool(comptime Context: type, comptime worker_fn: fn (*WorkerInfo(Context)) void) type {
+    const Info = WorkerInfo(Context);
+
     return struct {
         const Self = @This();
 
         threads: []std.Thread,
+        worker_infos: []Info,
+        barrier: *StartBarrier,
         allocator: Allocator,
 
-        /// Create a thread pool with `n_workers` threads, each running `worker_fn`.
-        /// The context is passed to each worker. Workers run until they return.
+        /// Create a thread pool with `n_workers` threads.
+        ///
+        /// Each worker receives a `WorkerInfo` struct containing its unique index
+        /// (0..n_workers-1), the shared context, and a pointer to the barrier.
+        ///
+        /// Workers should call `info.barrier.started()` early in their execution.
+        /// The master then calls `pool.waitForStart()` to block until all workers
+        /// are ready, then releases them all simultaneously.
         pub fn init(
             allocator: Allocator,
             n_workers: usize,
-            worker_fn: *const fn (Context) void,
             context: Context,
         ) !Self {
             const threads = try allocator.alloc(std.Thread, n_workers);
+            errdefer allocator.free(threads);
+            const worker_infos = try allocator.alloc(Info, n_workers);
+            errdefer allocator.free(worker_infos);
+            const barrier = try allocator.create(StartBarrier);
+            errdefer allocator.destroy(barrier);
+            barrier.* = StartBarrier.init(n_workers);
+
             var spawned: usize = 0;
             errdefer {
+                // If spawn fails partway, signal already-started workers to proceed
+                // and join them so they can exit cleanly.
+                barrier.mutex.lock();
+                barrier.go_signal = true;
+                barrier.cond.broadcast();
+                barrier.mutex.unlock();
                 for (0..spawned) |i| threads[i].join();
-                allocator.free(threads);
             }
 
             for (0..n_workers) |i| {
-                threads[i] = try std.Thread.spawn(.{}, worker_fn, .{context});
+                worker_infos[i] = Info{
+                    .worker_index = i,
+                    .context = context,
+                    .barrier = barrier,
+                };
+                threads[i] = try std.Thread.spawn(.{}, worker_fn, .{&worker_infos[i]});
                 spawned += 1;
             }
 
             return Self{
                 .threads = threads,
+                .worker_infos = worker_infos,
+                .barrier = barrier,
                 .allocator = allocator,
             };
+        }
+
+        /// Block the master thread until all workers have called
+        /// `barrier.started()`, then release them all to begin work.
+        pub fn waitForStart(self: *Self) void {
+            self.barrier.waitForStart();
+        }
+
+        /// Return the number of worker threads in the pool.
+        pub fn workerCount(self: *const Self) usize {
+            return self.threads.len;
         }
 
         /// Wait for all worker threads to complete and free resources.
         pub fn deinit(self: *Self) void {
             for (self.threads) |t| t.join();
+            self.allocator.destroy(self.barrier);
+            self.allocator.free(self.worker_infos);
             self.allocator.free(self.threads);
         }
     };
@@ -469,6 +583,149 @@ test "DualWorkQueue: reset moves items back to reader queue" {
     // Reader should be able to get items back
     try q.readerUpdate(null, &buf);
     try std.testing.expect(buf == 10 or buf == 20);
+}
+
+test "ThreadPool: basic spawn and join lifecycle" {
+    const Pool = ThreadPool(void, struct {
+        fn worker(info: *WorkerInfo(void)) void {
+            info.barrier.started();
+        }
+    }.worker);
+
+    var pool = try Pool.init(std.testing.allocator, 4, {});
+    pool.waitForStart();
+    pool.deinit();
+}
+
+test "ThreadPool: all workers execute with unique indices" {
+    const n_workers = 8;
+    var executed = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(0)} ** n_workers;
+
+    const Ctx = struct {
+        flags: *[n_workers]std.atomic.Value(u32),
+    };
+    const Pool = ThreadPool(Ctx, struct {
+        fn worker(info: *WorkerInfo(Ctx)) void {
+            info.barrier.started();
+            info.context.flags[info.worker_index].store(1, .release);
+        }
+    }.worker);
+
+    var pool = try Pool.init(std.testing.allocator, n_workers, Ctx{ .flags = &executed });
+    pool.waitForStart();
+    pool.deinit();
+
+    // Verify all workers executed exactly once with unique indices.
+    for (0..n_workers) |i| {
+        try std.testing.expectEqual(@as(u32, 1), executed[i].load(.acquire));
+    }
+}
+
+test "ThreadPool: workers receive correct context and indices" {
+    const n_workers = 4;
+    var index_sum = std.atomic.Value(u64).init(0);
+    var context_sum = std.atomic.Value(u64).init(0);
+
+    const Ctx = struct {
+        index_sum: *std.atomic.Value(u64),
+        context_sum: *std.atomic.Value(u64),
+        magic: u64,
+    };
+    const Pool = ThreadPool(Ctx, struct {
+        fn worker(info: *WorkerInfo(Ctx)) void {
+            info.barrier.started();
+            _ = info.context.index_sum.fetchAdd(@intCast(info.worker_index), .monotonic);
+            _ = info.context.context_sum.fetchAdd(info.context.magic, .monotonic);
+        }
+    }.worker);
+
+    var pool = try Pool.init(std.testing.allocator, n_workers, Ctx{
+        .index_sum = &index_sum,
+        .context_sum = &context_sum,
+        .magic = 42,
+    });
+    pool.waitForStart();
+    pool.deinit();
+
+    // Indices 0+1+2+3 = 6
+    try std.testing.expectEqual(@as(u64, 6), index_sum.load(.monotonic));
+    // Each of 4 workers adds 42 => 168
+    try std.testing.expectEqual(@as(u64, 168), context_sum.load(.monotonic));
+}
+
+test "ThreadPool: work distribution via WorkQueue" {
+    const n_workers = 4;
+    const n_items = 100;
+
+    var queue = try WorkQueue(u32).init(std.testing.allocator, n_items + n_workers);
+    defer queue.deinit();
+
+    var result_sum = std.atomic.Value(u64).init(0);
+
+    const Ctx = struct {
+        queue: *WorkQueue(u32),
+        result_sum: *std.atomic.Value(u64),
+    };
+    const Pool = ThreadPool(Ctx, struct {
+        fn worker(info: *WorkerInfo(Ctx)) void {
+            info.barrier.started();
+            while (info.context.queue.receive()) |item| {
+                _ = info.context.result_sum.fetchAdd(item, .monotonic);
+            }
+        }
+    }.worker);
+
+    var pool = try Pool.init(std.testing.allocator, n_workers, Ctx{
+        .queue = &queue,
+        .result_sum = &result_sum,
+    });
+    pool.waitForStart();
+
+    // Produce work items after all workers are ready.
+    for (1..n_items + 1) |i| {
+        queue.send(@intCast(i)) catch unreachable;
+    }
+    queue.close();
+
+    pool.deinit();
+
+    // Sum of 1..100 = 5050
+    try std.testing.expectEqual(@as(u64, 5050), result_sum.load(.monotonic));
+}
+
+test "ThreadPool: start barrier ensures workers wait for go signal" {
+    const n_workers = 4;
+    var pre_barrier = std.atomic.Value(u32).init(0);
+    var post_barrier = std.atomic.Value(u32).init(0);
+
+    const Ctx = struct {
+        pre_barrier: *std.atomic.Value(u32),
+        post_barrier: *std.atomic.Value(u32),
+    };
+    const Pool = ThreadPool(Ctx, struct {
+        fn worker(info: *WorkerInfo(Ctx)) void {
+            _ = info.context.pre_barrier.fetchAdd(1, .monotonic);
+            info.barrier.started();
+            _ = info.context.post_barrier.fetchAdd(1, .monotonic);
+        }
+    }.worker);
+
+    var pool = try Pool.init(std.testing.allocator, n_workers, Ctx{
+        .pre_barrier = &pre_barrier,
+        .post_barrier = &post_barrier,
+    });
+
+    // Wait for all workers to reach the barrier.
+    pool.waitForStart();
+
+    // At this point, all workers have incremented pre_barrier.
+    try std.testing.expectEqual(@as(u32, n_workers), pre_barrier.load(.monotonic));
+
+    // Workers are now released; wait for them to finish.
+    pool.deinit();
+
+    // All workers should have incremented post_barrier.
+    try std.testing.expectEqual(@as(u32, n_workers), post_barrier.load(.monotonic));
 }
 
 test "cpuCount: at least 1" {
