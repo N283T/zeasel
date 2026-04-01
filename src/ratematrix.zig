@@ -61,6 +61,23 @@ pub fn probMatrix(q: Matrix, t: f64) !Matrix {
     return q.exp(t);
 }
 
+/// Compute the probability matrix P(t) = exp(tQ) using eigendecomposition.
+///
+/// For reversible rate matrices (those satisfying detailed balance), this
+/// first symmetrizes Q using the stationary frequencies pi, diagonalizes
+/// the symmetric matrix via Jacobi, and then computes P = R * diag(exp(t*lambda)) * L.
+///
+/// When computing P(t) for many different t values (as in phylogenetic
+/// likelihood calculations), call `Matrix.diagonalizeSymmetrizable()` once
+/// and then `Matrix.expFromEigen()` for each t instead.
+///
+/// Caller owns the returned Matrix.
+pub fn probMatrixEigen(q: Matrix, pi: []const f64, t: f64) !Matrix {
+    var eigen = try q.diagonalizeSymmetrizable(q.allocator, pi);
+    defer eigen.deinit();
+    return Matrix.expFromEigen(q.allocator, eigen, t);
+}
+
 /// Validate a rate matrix: rows should sum to ~0.
 pub fn isValid(q: Matrix, tol: f64) bool {
     if (q.rows != q.cols) return false;
@@ -558,4 +575,76 @@ test "setWAG: custom uniform frequencies give symmetric Q" {
             }
         }
     }
+}
+
+test "probMatrixEigen: JC matches direct exp" {
+    const allocator = std.testing.allocator;
+    var q = try setJukesCantor(allocator, 4);
+    defer q.deinit();
+
+    const pi = [_]f64{ 0.25, 0.25, 0.25, 0.25 };
+    var p_eigen = try probMatrixEigen(q, &pi, 0.5);
+    defer p_eigen.deinit();
+    var p_direct = try probMatrix(q, 0.5);
+    defer p_direct.deinit();
+
+    for (0..4) |i| {
+        for (0..4) |j| {
+            try std.testing.expectApproxEqAbs(p_direct.get(i, j), p_eigen.get(i, j), 1e-8);
+        }
+    }
+    try std.testing.expect(validateP(p_eigen, 1e-8));
+}
+
+test "probMatrixEigen: WAG with default frequencies" {
+    const allocator = std.testing.allocator;
+    var q = try setWAG(allocator, null);
+    defer q.deinit();
+
+    var p_eigen = try probMatrixEigen(q, &composition.wag, 0.1);
+    defer p_eigen.deinit();
+    var p_direct = try probMatrix(q, 0.1);
+    defer p_direct.deinit();
+
+    // P from eigendecomposition should match direct matrix exp
+    for (0..20) |i| {
+        for (0..20) |j| {
+            try std.testing.expectApproxEqAbs(p_direct.get(i, j), p_eigen.get(i, j), 1e-6);
+        }
+    }
+    try std.testing.expect(validateP(p_eigen, 1e-6));
+}
+
+test "probMatrixEigen: Kimura with non-uniform pi" {
+    const allocator = std.testing.allocator;
+    // Build Kimura-like Q with non-uniform frequencies
+    const pi = [_]f64{ 0.1, 0.2, 0.3, 0.4 };
+    const alpha: f64 = 2.0;
+    const beta: f64 = 1.0;
+
+    var q = try Matrix.init(allocator, 4, 4);
+    defer q.deinit();
+    for (0..4) |i| {
+        var row_sum: f64 = 0;
+        for (0..4) |j| {
+            if (i != j) {
+                const rate = if ((i + j) % 2 == 0) alpha else beta;
+                q.set(i, j, rate * pi[j]);
+                row_sum += rate * pi[j];
+            }
+        }
+        q.set(i, i, -row_sum);
+    }
+
+    var p_eigen = try probMatrixEigen(q, &pi, 0.3);
+    defer p_eigen.deinit();
+    var p_direct = try probMatrix(q, 0.3);
+    defer p_direct.deinit();
+
+    for (0..4) |i| {
+        for (0..4) |j| {
+            try std.testing.expectApproxEqAbs(p_direct.get(i, j), p_eigen.get(i, j), 1e-8);
+        }
+    }
+    try std.testing.expect(validateP(p_eigen, 1e-8));
 }

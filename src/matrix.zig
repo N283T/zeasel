@@ -337,6 +337,28 @@ pub const Matrix = struct {
         }
     };
 
+    /// Result type for symmetrizable matrix eigendecomposition.
+    /// Stores eigenvalues and both left/right eigenvector matrices
+    /// for reconstructing exp(tQ) = R * diag(exp(t*lambda)) * L,
+    /// where R has right eigenvectors as columns and L has left
+    /// eigenvectors as rows (L = R^{-1}).
+    pub const SymEigenResult = struct {
+        eigenvalues: []f64,
+        /// Right eigenvector matrix (columns are eigenvectors).
+        /// Q = right * diag(eigenvalues) * left
+        right: Matrix,
+        /// Left eigenvector matrix (rows are eigenvectors).
+        /// left = right^{-1}
+        left: Matrix,
+        allocator: Allocator,
+
+        pub fn deinit(self: *SymEigenResult) void {
+            self.allocator.free(self.eigenvalues);
+            self.right.deinit();
+            self.left.deinit();
+        }
+    };
+
     /// Eigenvalue decomposition for a square symmetric matrix using the
     /// classical Jacobi eigenvalue algorithm.
     ///
@@ -459,6 +481,127 @@ pub const Matrix = struct {
             .eigenvectors = v,
             .allocator = allocator,
         };
+    }
+
+    /// Eigenvalue decomposition for a symmetrizable (reversible) rate matrix.
+    ///
+    /// A rate matrix Q satisfying detailed balance (pi[i]*Q[i][j] = pi[j]*Q[j][i])
+    /// can be symmetrized as S[i][j] = sqrt(pi[i]/pi[j]) * Q[i][j], which is
+    /// real symmetric and diagonalizable by the Jacobi algorithm.
+    ///
+    /// Given S = V * diag(lambda) * V^T, the right eigenvectors of Q are
+    /// R[i][k] = V[i][k] / sqrt(pi[i]) and the left eigenvectors (rows of L)
+    /// are L[k][j] = V[j][k] * sqrt(pi[j]), so that Q = R * diag(lambda) * L.
+    ///
+    /// This is the standard approach for biological rate matrices (WAG, LG, JTT,
+    /// JC, Kimura, etc.) which are all time-reversible.
+    ///
+    /// Returns eigenvalues and left/right eigenvector matrices such that
+    /// exp(tQ) = right * diag(exp(t*lambda)) * left.
+    pub fn diagonalizeSymmetrizable(self: Matrix, allocator: Allocator, pi: []const f64) !SymEigenResult {
+        if (self.rows != self.cols) return error.DimensionMismatch;
+        const n = self.rows;
+        if (pi.len != n) return error.DimensionMismatch;
+
+        // Verify all frequencies are positive
+        for (pi) |p| {
+            if (p <= 0.0) return error.InvalidFrequencies;
+        }
+
+        // Build the symmetric matrix S[i][j] = sqrt(pi[i]/pi[j]) * Q[i][j]
+        // For the diagonal, S[i][i] = Q[i][i] (since sqrt(pi[i]/pi[i]) = 1).
+        var sqrt_pi = try allocator.alloc(f64, n);
+        defer allocator.free(sqrt_pi);
+        for (0..n) |i| {
+            sqrt_pi[i] = @sqrt(pi[i]);
+        }
+
+        var s = try Matrix.init(allocator, n, n);
+        defer s.deinit();
+
+        for (0..n) |i| {
+            for (0..n) |j| {
+                s.set(i, j, (sqrt_pi[i] / sqrt_pi[j]) * self.get(i, j));
+            }
+        }
+
+        // Force exact symmetry (correct for floating-point rounding)
+        for (0..n) |i| {
+            for (i + 1..n) |j| {
+                const avg = (s.get(i, j) + s.get(j, i)) * 0.5;
+                s.set(i, j, avg);
+                s.set(j, i, avg);
+            }
+        }
+
+        // Diagonalize S using existing Jacobi algorithm
+        var eigen = try s.diagonalize(allocator);
+        defer {
+            allocator.free(eigen.eigenvalues_re);
+            allocator.free(eigen.eigenvalues_im);
+            // eigenvectors (V) will be consumed below
+        }
+
+        // Build right eigenvector matrix: R[i][k] = V[i][k] / sqrt(pi[i])
+        var right = try eigen.eigenvectors.clone();
+        errdefer right.deinit();
+        for (0..n) |i| {
+            for (0..n) |k| {
+                right.set(i, k, eigen.eigenvectors.get(i, k) / sqrt_pi[i]);
+            }
+        }
+
+        // Build left eigenvector matrix: L[k][j] = V[j][k] * sqrt(pi[j])
+        var left = try Matrix.init(allocator, n, n);
+        errdefer left.deinit();
+        for (0..n) |k| {
+            for (0..n) |j| {
+                left.set(k, j, eigen.eigenvectors.get(j, k) * sqrt_pi[j]);
+            }
+        }
+
+        eigen.eigenvectors.deinit();
+
+        // Copy eigenvalues (real only; imaginary parts are zero for symmetric S)
+        const eigenvalues = try allocator.alloc(f64, n);
+        errdefer allocator.free(eigenvalues);
+        @memcpy(eigenvalues, eigen.eigenvalues_re);
+
+        return SymEigenResult{
+            .eigenvalues = eigenvalues,
+            .right = right,
+            .left = left,
+            .allocator = allocator,
+        };
+    }
+
+    /// Compute exp(t * self) using pre-computed eigendecomposition.
+    ///
+    /// Given eigenvalues and left/right eigenvector matrices from
+    /// diagonalizeSymmetrizable(), computes:
+    ///   exp(tQ) = R * diag(exp(t * lambda_i)) * L
+    ///
+    /// This is much faster than the general matrix exponential (scaling
+    /// and squaring with Taylor series) for repeated evaluations at
+    /// different t values, which is the common case in phylogenetics.
+    pub fn expFromEigen(allocator: Allocator, eigen: SymEigenResult, t: f64) !Matrix {
+        const n = eigen.right.rows;
+
+        var result = try Matrix.init(allocator, n, n);
+        errdefer result.deinit();
+
+        // P[i][j] = sum_k R[i][k] * exp(t * lambda[k]) * L[k][j]
+        for (0..n) |i| {
+            for (0..n) |j| {
+                var val: f64 = 0.0;
+                for (0..n) |k| {
+                    val += eigen.right.get(i, k) * @exp(t * eigen.eigenvalues[k]) * eigen.left.get(k, j);
+                }
+                result.set(i, j, val);
+            }
+        }
+
+        return result;
     }
 };
 
@@ -869,4 +1012,243 @@ test "Matrix.diagonalize: 4x4 rate-matrix-like" {
             try std.testing.expectApproxEqAbs(expected, vtv.get(i, j), 1e-10);
         }
     }
+}
+
+test "Matrix.diagonalizeSymmetrizable: 2x2 Jukes-Cantor" {
+    const allocator = std.testing.allocator;
+    // JC rate matrix for 2 states: Q = [[-1, 1], [1, -1]], pi = [0.5, 0.5]
+    var q = try Matrix.init(allocator, 2, 2);
+    defer q.deinit();
+    q.set(0, 0, -1.0);
+    q.set(0, 1, 1.0);
+    q.set(1, 0, 1.0);
+    q.set(1, 1, -1.0);
+
+    const pi = [_]f64{ 0.5, 0.5 };
+    var eigen = try q.diagonalizeSymmetrizable(allocator, &pi);
+    defer eigen.deinit();
+
+    // Eigenvalues of 2-state JC: 0 and -2
+    var sorted = [_]f64{ eigen.eigenvalues[0], eigen.eigenvalues[1] };
+    if (sorted[0] > sorted[1]) {
+        const tmp = sorted[0];
+        sorted[0] = sorted[1];
+        sorted[1] = tmp;
+    }
+    try std.testing.expectApproxEqAbs(@as(f64, -2.0), sorted[0], 1e-10);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), sorted[1], 1e-10);
+}
+
+test "Matrix.diagonalizeSymmetrizable: left * right = identity" {
+    const allocator = std.testing.allocator;
+    // 3x3 rate matrix satisfying detailed balance
+    // Q[i][j] = S[i][j] * pi[j], S symmetric, diagonal set so rows sum to 0
+    const pi = [_]f64{ 0.2, 0.3, 0.5 };
+    // Symmetric exchangeabilities
+    const s01: f64 = 1.0;
+    const s02: f64 = 0.5;
+    const s12: f64 = 0.8;
+
+    var q = try Matrix.init(allocator, 3, 3);
+    defer q.deinit();
+    q.set(0, 1, s01 * pi[1]);
+    q.set(0, 2, s02 * pi[2]);
+    q.set(1, 0, s01 * pi[0]);
+    q.set(1, 2, s12 * pi[2]);
+    q.set(2, 0, s02 * pi[0]);
+    q.set(2, 1, s12 * pi[1]);
+    // Diagonal: rows sum to zero
+    for (0..3) |i| {
+        var row_sum: f64 = 0;
+        for (0..3) |j| {
+            if (i != j) row_sum += q.get(i, j);
+        }
+        q.set(i, i, -row_sum);
+    }
+
+    var eigen = try q.diagonalizeSymmetrizable(allocator, &pi);
+    defer eigen.deinit();
+
+    // L * R should be identity
+    var prod = try Matrix.multiply(allocator, eigen.left, eigen.right);
+    defer prod.deinit();
+    for (0..3) |i| {
+        for (0..3) |j| {
+            const expected: f64 = if (i == j) 1.0 else 0.0;
+            try std.testing.expectApproxEqAbs(expected, prod.get(i, j), 1e-10);
+        }
+    }
+}
+
+test "Matrix.diagonalizeSymmetrizable: R * diag(lambda) * L reconstructs Q" {
+    const allocator = std.testing.allocator;
+    const pi = [_]f64{ 0.2, 0.3, 0.5 };
+    const s01: f64 = 1.0;
+    const s02: f64 = 0.5;
+    const s12: f64 = 0.8;
+
+    var q = try Matrix.init(allocator, 3, 3);
+    defer q.deinit();
+    q.set(0, 1, s01 * pi[1]);
+    q.set(0, 2, s02 * pi[2]);
+    q.set(1, 0, s01 * pi[0]);
+    q.set(1, 2, s12 * pi[2]);
+    q.set(2, 0, s02 * pi[0]);
+    q.set(2, 1, s12 * pi[1]);
+    for (0..3) |i| {
+        var row_sum: f64 = 0;
+        for (0..3) |j| {
+            if (i != j) row_sum += q.get(i, j);
+        }
+        q.set(i, i, -row_sum);
+    }
+
+    var eigen = try q.diagonalizeSymmetrizable(allocator, &pi);
+    defer eigen.deinit();
+
+    // Reconstruct Q = R * diag(lambda) * L
+    var d = try Matrix.init(allocator, 3, 3);
+    defer d.deinit();
+    for (0..3) |i| d.set(i, i, eigen.eigenvalues[i]);
+
+    var rd = try Matrix.multiply(allocator, eigen.right, d);
+    defer rd.deinit();
+    var reconstructed = try Matrix.multiply(allocator, rd, eigen.left);
+    defer reconstructed.deinit();
+
+    for (0..3) |i| {
+        for (0..3) |j| {
+            try std.testing.expectApproxEqAbs(q.get(i, j), reconstructed.get(i, j), 1e-10);
+        }
+    }
+}
+
+test "Matrix.diagonalizeSymmetrizable: 4x4 Kimura-like asymmetric Q" {
+    const allocator = std.testing.allocator;
+    // Non-uniform pi makes Q non-symmetric, but still reversible
+    const pi = [_]f64{ 0.1, 0.2, 0.3, 0.4 };
+    const alpha: f64 = 2.0;
+    const beta: f64 = 1.0;
+
+    var q = try Matrix.init(allocator, 4, 4);
+    defer q.deinit();
+
+    for (0..4) |i| {
+        var row_sum: f64 = 0;
+        for (0..4) |j| {
+            if (i != j) {
+                const rate = if ((i + j) % 2 == 0) alpha else beta;
+                q.set(i, j, rate * pi[j]);
+                row_sum += rate * pi[j];
+            }
+        }
+        q.set(i, i, -row_sum);
+    }
+
+    // Q is NOT symmetric (pi non-uniform) but IS symmetrizable
+    try std.testing.expect(!q.isSymmetric(1e-10));
+
+    var eigen = try q.diagonalizeSymmetrizable(allocator, &pi);
+    defer eigen.deinit();
+
+    // One eigenvalue should be 0 (stationary)
+    var has_zero = false;
+    for (eigen.eigenvalues) |lam| {
+        if (@abs(lam) < 1e-10) has_zero = true;
+    }
+    try std.testing.expect(has_zero);
+
+    // All eigenvalues should be <= 0 for a valid rate matrix
+    for (eigen.eigenvalues) |lam| {
+        try std.testing.expect(lam <= 1e-10);
+    }
+
+    // exp(tQ) via eigendecomposition should match matrix exp
+    var p_eigen = try Matrix.expFromEigen(allocator, eigen, 0.5);
+    defer p_eigen.deinit();
+    var p_direct = try q.exp(0.5);
+    defer p_direct.deinit();
+
+    for (0..4) |i| {
+        for (0..4) |j| {
+            try std.testing.expectApproxEqAbs(p_direct.get(i, j), p_eigen.get(i, j), 1e-8);
+        }
+    }
+}
+
+test "Matrix.expFromEigen: P(0) = I" {
+    const allocator = std.testing.allocator;
+    const pi = [_]f64{ 0.5, 0.5 };
+    var q = try Matrix.init(allocator, 2, 2);
+    defer q.deinit();
+    q.set(0, 0, -1.0);
+    q.set(0, 1, 1.0);
+    q.set(1, 0, 1.0);
+    q.set(1, 1, -1.0);
+
+    var eigen = try q.diagonalizeSymmetrizable(allocator, &pi);
+    defer eigen.deinit();
+
+    var p = try Matrix.expFromEigen(allocator, eigen, 0.0);
+    defer p.deinit();
+
+    for (0..2) |i| {
+        for (0..2) |j| {
+            const expected: f64 = if (i == j) 1.0 else 0.0;
+            try std.testing.expectApproxEqAbs(expected, p.get(i, j), 1e-10);
+        }
+    }
+}
+
+test "Matrix.expFromEigen: rows of P sum to 1" {
+    const allocator = std.testing.allocator;
+    const pi = [_]f64{ 0.1, 0.2, 0.3, 0.4 };
+
+    var q = try Matrix.init(allocator, 4, 4);
+    defer q.deinit();
+    // Build a simple reversible rate matrix
+    for (0..4) |i| {
+        var row_sum: f64 = 0;
+        for (0..4) |j| {
+            if (i != j) {
+                q.set(i, j, pi[j]);
+                row_sum += pi[j];
+            }
+        }
+        q.set(i, i, -row_sum);
+    }
+
+    var eigen = try q.diagonalizeSymmetrizable(allocator, &pi);
+    defer eigen.deinit();
+
+    var p = try Matrix.expFromEigen(allocator, eigen, 1.0);
+    defer p.deinit();
+
+    for (0..4) |i| {
+        var row_sum: f64 = 0;
+        for (0..4) |j| row_sum += p.get(i, j);
+        try std.testing.expectApproxEqAbs(@as(f64, 1.0), row_sum, 1e-10);
+    }
+}
+
+test "Matrix.diagonalizeSymmetrizable: invalid frequencies" {
+    const allocator = std.testing.allocator;
+    var q = try Matrix.init(allocator, 2, 2);
+    defer q.deinit();
+    q.set(0, 0, -1.0);
+    q.set(0, 1, 1.0);
+    q.set(1, 0, 1.0);
+    q.set(1, 1, -1.0);
+
+    // Zero frequency
+    const pi_zero = [_]f64{ 0.0, 1.0 };
+    try std.testing.expectError(error.InvalidFrequencies, q.diagonalizeSymmetrizable(allocator, &pi_zero));
+
+    // Negative frequency
+    const pi_neg = [_]f64{ -0.5, 1.5 };
+    try std.testing.expectError(error.InvalidFrequencies, q.diagonalizeSymmetrizable(allocator, &pi_neg));
+
+    // Wrong dimension
+    const pi_wrong = [_]f64{ 0.5, 0.3, 0.2 };
+    try std.testing.expectError(error.DimensionMismatch, q.diagonalizeSymmetrizable(allocator, &pi_wrong));
 }

@@ -13,6 +13,7 @@ const math = std.math;
 const alphabet_mod = @import("alphabet.zig");
 const Alphabet = alphabet_mod.Alphabet;
 const composition = @import("composition.zig");
+const Matrix = @import("matrix.zig").Matrix;
 const Allocator = std.mem.Allocator;
 
 /// Size of the full score matrix dimension (amino acid Kp).
@@ -854,4 +855,260 @@ test "relativeEntropy: invalid probabilities" {
     var bad_bg: [20]f64 = undefined;
     for (&bad_bg) |*v| v.* = 0.1; // sums to 2.0
     try std.testing.expectError(error.InvalidProbabilities, blosum62.relativeEntropy(&bad_bg, 0.3466));
+}
+
+// ---------------------------------------------------------------------------
+// Probabilistic score matrix derivation
+// ---------------------------------------------------------------------------
+
+/// Derive an integer score matrix from target probabilities and background
+/// frequencies.
+///
+/// For each canonical residue pair (i, j):
+///   s[i][j] = round( log(pij[i][j] / (fi[i] * fj[j])) / lambda )
+///
+/// Rounding uses "half away from zero" (standard rounding).
+/// Only the K=20 canonical amino acid portion is filled; degenerate codes
+/// are set to zero.
+///
+/// Reference: Easel `esl_scorematrix_SetFromProbs()`.
+pub fn setFromProbs(
+    allocator: Allocator,
+    lambda: f64,
+    pij: Matrix,
+    fi: []const f64,
+    fj: []const f64,
+) !ScoreMatrix {
+    const k: usize = 20;
+    std.debug.assert(pij.rows >= k and pij.cols >= k);
+    std.debug.assert(fi.len >= k and fj.len >= k);
+    std.debug.assert(lambda > 0);
+
+    const data_ptr = try allocator.create([Kp][Kp]i16);
+    errdefer allocator.destroy(data_ptr);
+
+    // Initialize to zero (covers degenerate, gap, missing positions).
+    for (data_ptr) |*row| {
+        @memset(row, 0);
+    }
+
+    for (0..k) |i| {
+        for (0..k) |j| {
+            const sc: f64 = @log(pij.get(i, j) / (fi[i] * fj[j])) / lambda;
+            // Round to nearest integer, half away from zero.
+            data_ptr[i][j] = @intFromFloat(@round(sc));
+        }
+    }
+
+    return ScoreMatrix{
+        .data = data_ptr,
+        .name = "from_probs",
+        .abc = &alphabet_mod.amino,
+        .owned = data_ptr,
+        .allocator = allocator,
+    };
+}
+
+/// Result of probifyGivenBG: the solved scale parameter and target
+/// probability matrix.
+pub const ProbifyResult = struct {
+    lambda: f64,
+    pij: Matrix,
+
+    pub fn deinit(self: *ProbifyResult) void {
+        self.pij.deinit();
+    }
+};
+
+/// Given a score matrix and background frequencies, solve for the scale
+/// parameter lambda and recover the implicit target probabilities.
+///
+/// Uses Newton-Raphson to find lambda such that:
+///   sum_ij fi[i] * fj[j] * exp(lambda * s[i][j]) = 1.0
+///
+/// Then computes:
+///   pij[i][j] = fi[i] * fj[j] * exp(lambda * s[i][j])
+///
+/// Reference: Easel `esl_scorematrix_ProbifyGivenBG()`.
+pub fn probifyGivenBG(
+    allocator: Allocator,
+    sm: ScoreMatrix,
+    fi: []const f64,
+    fj: []const f64,
+) !ProbifyResult {
+    const k: usize = 20;
+    std.debug.assert(fi.len >= k and fj.len >= k);
+
+    // Find the maximum score to set the initial lambda guess.
+    const s_max: f64 = @floatFromInt(sm.maxScore());
+    if (s_max <= 0) return error.InvalidScoreMatrix;
+
+    // Bracket the root: start from 1/s_max and double until f(lambda) > 0.
+    // f(lambda) = sum_ij fi[i]*fj[j]*exp(lambda*s[i][j]) - 1.0
+    var lambda_guess: f64 = 1.0 / s_max;
+    var fx: f64 = -1.0;
+    while (lambda_guess < 50.0) {
+        fx = evalLambdaFunc(sm, fi, fj, k, lambda_guess);
+        if (fx > 0) break;
+        lambda_guess *= 2.0;
+    }
+    if (fx <= 0) return error.FailedToBracket;
+
+    // Newton-Raphson iteration.
+    const max_iter: usize = 100;
+    const abs_tol: f64 = 1e-15;
+    const rel_tol: f64 = 1e-15;
+
+    var lambda: f64 = lambda_guess;
+    fx = evalLambdaFunc(sm, fi, fj, k, lambda);
+    var dfx: f64 = evalLambdaDeriv(sm, fi, fj, k, lambda);
+
+    for (0..max_iter) |_| {
+        const x0 = lambda;
+        lambda = lambda - fx / dfx;
+
+        fx = evalLambdaFunc(sm, fi, fj, k, lambda);
+        dfx = evalLambdaDeriv(sm, fi, fj, k, lambda);
+
+        if (fx == 0.0) break;
+        if (@abs(lambda - x0) < abs_tol + rel_tol * lambda or @abs(fx) < abs_tol) break;
+    } else {
+        return error.DidNotConverge;
+    }
+
+    // Compute target probabilities: pij[i][j] = fi[i] * fj[j] * exp(lambda * s[i][j])
+    var pij = try Matrix.init(allocator, k, k);
+    errdefer pij.deinit();
+
+    for (0..k) |i| {
+        for (0..k) |j| {
+            const s: f64 = @floatFromInt(sm.data[i][j]);
+            pij.set(i, j, fi[i] * fj[j] * @exp(lambda * s));
+        }
+    }
+
+    return ProbifyResult{ .lambda = lambda, .pij = pij };
+}
+
+/// Evaluate f(lambda) = sum_ij fi[i]*fj[j]*exp(lambda*s[i][j]) - 1.0
+fn evalLambdaFunc(
+    sm: ScoreMatrix,
+    fi: []const f64,
+    fj: []const f64,
+    k: usize,
+    lambda: f64,
+) f64 {
+    var total: f64 = 0;
+    for (0..k) |i| {
+        for (0..k) |j| {
+            const s: f64 = @floatFromInt(sm.data[i][j]);
+            total += fi[i] * fj[j] * @exp(lambda * s);
+        }
+    }
+    return total - 1.0;
+}
+
+/// Evaluate f'(lambda) = sum_ij fi[i]*fj[j]*s[i][j]*exp(lambda*s[i][j])
+fn evalLambdaDeriv(
+    sm: ScoreMatrix,
+    fi: []const f64,
+    fj: []const f64,
+    k: usize,
+    lambda: f64,
+) f64 {
+    var total: f64 = 0;
+    for (0..k) |i| {
+        for (0..k) |j| {
+            const s: f64 = @floatFromInt(sm.data[i][j]);
+            total += fi[i] * fj[j] * s * @exp(lambda * s);
+        }
+    }
+    return total;
+}
+
+test "setFromProbs: round-trip with BLOSUM62" {
+    // Use probifyGivenBG to get lambda and pij from BLOSUM62,
+    // then reconstruct the score matrix and verify it matches.
+    const allocator = std.testing.allocator;
+
+    var result = try probifyGivenBG(allocator, blosum62, &composition.bl62, &composition.bl62);
+    defer result.deinit();
+
+    var sm = try setFromProbs(allocator, result.lambda, result.pij, &composition.bl62, &composition.bl62);
+    defer sm.deinit();
+
+    // The reconstructed scores should match the original for all canonical pairs.
+    for (0..20) |i| {
+        for (0..20) |j| {
+            try std.testing.expectEqual(blosum62.data[i][j], sm.data[i][j]);
+        }
+    }
+}
+
+test "probifyGivenBG: lambda is positive and probabilities sum to ~1.0" {
+    const allocator = std.testing.allocator;
+
+    var result = try probifyGivenBG(allocator, blosum62, &composition.bl62, &composition.bl62);
+    defer result.deinit();
+
+    // Lambda must be positive for a valid score matrix.
+    try std.testing.expect(result.lambda > 0);
+
+    // Target probabilities must sum to approximately 1.0.
+    var total: f64 = 0;
+    for (0..20) |i| {
+        for (0..20) |j| {
+            const p = result.pij.get(i, j);
+            try std.testing.expect(p > 0);
+            total += p;
+        }
+    }
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), total, 1e-10);
+}
+
+test "probifyGivenBG: known BLOSUM62 lambda" {
+    const allocator = std.testing.allocator;
+
+    var result = try probifyGivenBG(allocator, blosum62, &composition.bl62, &composition.bl62);
+    defer result.deinit();
+
+    // Lambda for BLOSUM62 should be in a reasonable range (0.3-0.4).
+    // The exact value depends on the background frequency vector used.
+    try std.testing.expect(result.lambda > 0.3 and result.lambda < 0.4);
+}
+
+test "setFromProbs: scores are symmetric when inputs are symmetric" {
+    const allocator = std.testing.allocator;
+
+    // Build a symmetric pij from BLOSUM62 background.
+    var pij = try Matrix.init(allocator, 20, 20);
+    defer pij.deinit();
+
+    const lambda: f64 = 0.3;
+    // Create symmetric target probs from symmetric scores.
+    var z: f64 = 0;
+    for (0..20) |i| {
+        for (0..20) |j| {
+            const s: f64 = @floatFromInt(blosum62.data[i][j]);
+            const v = composition.bl62[i] * composition.bl62[j] * @exp(lambda * s);
+            pij.set(i, j, v);
+            z += v;
+        }
+    }
+    // Normalize.
+    for (0..20) |i| {
+        for (0..20) |j| {
+            pij.set(i, j, pij.get(i, j) / z);
+        }
+    }
+
+    var sm = try setFromProbs(allocator, lambda, pij, &composition.bl62, &composition.bl62);
+    defer sm.deinit();
+
+    // BLOSUM62 is symmetric, so the result should be too.
+    for (0..20) |i| {
+        for (i + 1..20) |j| {
+            try std.testing.expectEqual(sm.data[i][j], sm.data[j][i]);
+        }
+    }
 }
