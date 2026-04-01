@@ -109,13 +109,43 @@ pub const SsiIndex = union(enum) {
     }
 
     /// Compute subsequence positioning info.
-    /// Only supported for zeasel variant; returns null for easel.
-    pub fn findSubseq(self: SsiIndex, name: []const u8, start: u64, end: u64) ?struct { entry: SsiEntry, start: u64, end: u64 } {
-        switch (self) {
-            .zeasel => |zidx| return zidx.findSubseq(name, start, end),
-            .easel => return null,
+    /// For zeasel: validates coordinates and returns the entry with start/end.
+    /// For easel: computes byte offset using bpl/rpl from FileInfo.
+    pub fn findSubseq(self: *SsiIndex, allocator: Allocator, name: []const u8, start: u64, end: u64) !?SubseqResult {
+        switch (self.*) {
+            .zeasel => |zidx| {
+                const result = zidx.findSubseq(name, start, end) orelse return null;
+                return SubseqResult{
+                    .entry = SsiEntry{
+                        .name = try allocator.dupe(u8, result.entry.name),
+                        .offset = result.entry.offset,
+                        .data_offset = result.entry.data_offset,
+                        .seq_len = result.entry.seq_len,
+                        .file_id = result.entry.file_id,
+                    },
+                    .actual_offset = result.entry.data_offset,
+                    .start = result.start,
+                    .end = result.end,
+                };
+            },
+            .easel => |*eidx| {
+                const result = (try eidx.findSubseq(allocator, name, start, end)) orelse return null;
+                return SubseqResult{
+                    .entry = result.entry,
+                    .actual_offset = result.actual_offset,
+                    .start = start,
+                    .end = result.end,
+                };
+            },
         }
     }
+
+    pub const SubseqResult = struct {
+        entry: SsiEntry,
+        actual_offset: u64,
+        start: u64,
+        end: u64,
+    };
 
     /// Get the file name for a given file_id.
     pub fn fileInfo(self: SsiIndex, file_id: u16) ?[]const u8 {
@@ -208,4 +238,41 @@ test "SsiIndex.open: auto-detects easel format" {
     const e = (try idx.lookup(allocator, "test_seq")) orelse return error.ExpectedEntry;
     defer allocator.free(e.name);
     try std.testing.expectEqual(@as(u64, 42), e.seq_len);
+}
+
+test "SsiIndex.findSubseq: dispatches to easel variant" {
+    const allocator = std.testing.allocator;
+
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(allocator);
+
+    try easel_ssi.writeEaselHeader(&buf, allocator, .{
+        .nprimary = 1,
+        .file_bpls = &.{80},
+        .file_rpls = &.{60},
+    });
+    try easel_ssi.writePrimaryKey(&buf, allocator, .{ .key = "seq1", .r_off = 0, .d_off = 100, .len = 120 });
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.ssi", .data = buf.items });
+
+    const dir_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+    const ssi_path = try std.fmt.allocPrint(allocator, "{s}/test.ssi", .{dir_path});
+    defer allocator.free(ssi_path);
+
+    var idx = try SsiIndex.open(allocator, ssi_path);
+    defer idx.deinit();
+
+    // Start=61: offset = 100 + (60/60)*80 + (60%60) = 180
+    const result = (try idx.findSubseq(allocator, "seq1", 61, 70)) orelse return error.ExpectedResult;
+    defer allocator.free(result.entry.name);
+    try std.testing.expectEqual(@as(u64, 180), result.actual_offset);
+    try std.testing.expectEqual(@as(u64, 61), result.start);
+    try std.testing.expectEqual(@as(u64, 70), result.end);
+
+    // Missing key returns null.
+    const missing = try idx.findSubseq(allocator, "nonexistent", 1, 10);
+    try std.testing.expect(missing == null);
 }
