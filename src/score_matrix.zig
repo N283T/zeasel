@@ -396,7 +396,14 @@ pub fn getByName(name: []const u8) ?ScoreMatrix {
 // ---------------------------------------------------------------------------
 
 fn embedCanonical(comptime src: [20][20]i8) [Kp][Kp]i16 {
+    @setEvalBranchQuota(100_000);
+    const abc = alphabet_mod.amino;
+    const k: usize = abc.k; // 20
+    const kp: usize = abc.kp; // 29
+
     var m: [Kp][Kp]i16 = .{.{0} ** Kp} ** Kp;
+
+    // 1. Copy canonical 20x20 block.
     var i: usize = 0;
     while (i < 20) : (i += 1) {
         var j: usize = 0;
@@ -404,7 +411,110 @@ fn embedCanonical(comptime src: [20][20]i8) [Kp][Kp]i16 {
             m[i][j] = src[i][j];
         }
     }
+
+    // 2. Find minimum canonical score (used for nonresidue penalty).
+    var min_score: i16 = m[0][0];
+    i = 0;
+    while (i < k) : (i += 1) {
+        var j: usize = 0;
+        while (j < k) : (j += 1) {
+            if (m[i][j] < min_score) min_score = m[i][j];
+        }
+    }
+
+    // 3. Fill canonical-to-degenerate: S[i][jp] for i < K, jp > K
+    i = 0;
+    while (i < k) : (i += 1) {
+        // Gap column (k) stays 0.
+        // Degenerate columns: codes k+1 to kp-4 (inclusive).
+        var jp: usize = k + 1;
+        while (jp + 2 < kp) : (jp += 1) {
+            const mask_jp = abc.degen[jp];
+            const n_jp: i32 = @intCast(abc.ndegen[jp]);
+            if (n_jp == 0) continue; // stays 0
+            var sum: i32 = 0;
+            var j: usize = 0;
+            while (j < k) : (j += 1) {
+                if (mask_jp & (@as(u32, 1) << @intCast(j)) != 0) {
+                    sum += m[i][j];
+                }
+            }
+            m[i][jp] = @intCast(comptimeRoundedDiv(sum, n_jp));
+        }
+        // Nonresidue column: minimum canonical score.
+        m[i][kp - 2] = min_score;
+        // Missing column stays 0.
+    }
+
+    // 4. Gap row: all zeros (already initialized).
+
+    // 5. Degenerate rows: S[ip][j] for all j.
+    var ip: usize = k + 1;
+    while (ip + 2 < kp) : (ip += 1) {
+        const mask_ip = abc.degen[ip];
+        const n_ip: i32 = @intCast(abc.ndegen[ip]);
+        if (n_ip == 0) continue; // stays all 0
+
+        // Degenerate-to-canonical.
+        var j: usize = 0;
+        while (j < k) : (j += 1) {
+            var sum: i32 = 0;
+            var ci: usize = 0;
+            while (ci < k) : (ci += 1) {
+                if (mask_ip & (@as(u32, 1) << @intCast(ci)) != 0) {
+                    sum += m[ci][j];
+                }
+            }
+            m[ip][j] = @intCast(comptimeRoundedDiv(sum, n_ip));
+        }
+
+        // Gap stays 0.
+
+        // Degenerate-to-degenerate.
+        var jp2: usize = k + 1;
+        while (jp2 + 2 < kp) : (jp2 += 1) {
+            const mask_jp = abc.degen[jp2];
+            const n_jp: i32 = @intCast(abc.ndegen[jp2]);
+            if (n_jp == 0) continue;
+            var sum: i32 = 0;
+            j = 0;
+            while (j < k) : (j += 1) {
+                if (mask_jp & (@as(u32, 1) << @intCast(j)) != 0) {
+                    sum += m[ip][j];
+                }
+            }
+            m[ip][jp2] = @intCast(comptimeRoundedDiv(sum, n_jp));
+        }
+
+        // Nonresidue column: minimum canonical score.
+        m[ip][kp - 2] = min_score;
+        // Missing stays 0.
+    }
+
+    // 6. Nonresidue row: all minimum canonical score, except gap/missing = 0.
+    {
+        var j: usize = 0;
+        while (j < kp) : (j += 1) {
+            if (j == k or j == kp - 1) {
+                m[kp - 2][j] = 0;
+            } else {
+                m[kp - 2][j] = min_score;
+            }
+        }
+    }
+
+    // 7. Missing row: all zeros (already initialized).
+
     return m;
+}
+
+/// Integer division with rounding to nearest (half away from zero), comptime-compatible.
+fn comptimeRoundedDiv(num: i32, den: i32) i32 {
+    if (num >= 0) {
+        return @divTrunc(num + @divTrunc(den, 2), den);
+    } else {
+        return @divTrunc(num - @divTrunc(den, 2), den);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -716,8 +826,75 @@ test "blosum62: scoreByChar invalid character" {
 }
 
 test "blosum62: scoreByChar degenerate residue" {
-    // B is code 21 (D|N), should return 0 for comptime matrix (no degenerate scores set)
-    try std.testing.expectEqual(@as(i16, 0), try blosum62.scoreByChar('B', 'A'));
+    // B is code 21 (D|N). S[A][B] = round((S[A][D] + S[A][N]) / 2) = round((-2 + -2) / 2) = -2
+    try std.testing.expectEqual(@as(i16, -2), try blosum62.scoreByChar('B', 'A'));
+}
+
+test "blosum62: comptime degenerate X row is non-zero" {
+    // X (code 26) = all 20 canonical residues.
+    // S[X][A] = round(sum of S[i][A] for i=0..19 / 20).
+    // Column A: 4+0-2-1-2+0-2-1-1-1-1-2-1-1-1+1+0+0-3-2 = -16
+    // S[X][A] = round(-16 / 20) = round(-0.8) = -1
+    const x_code: u8 = 26;
+    try std.testing.expectEqual(@as(i16, -1), blosum62.score(x_code, 0));
+    // X row should be non-zero for most columns.
+    try std.testing.expect(blosum62.score(x_code, x_code) != 0);
+}
+
+test "blosum62: comptime nonresidue row uses minimum score" {
+    // Nonresidue (*) is code kp-2 = 27. Should be the minimum canonical score (-4 for BLOSUM62).
+    const nonres_code: u8 = 27;
+    try std.testing.expectEqual(@as(i16, -4), blosum62.score(nonres_code, 0));
+    try std.testing.expectEqual(@as(i16, -4), blosum62.score(0, nonres_code));
+    // Nonresidue-to-gap and nonresidue-to-missing should be 0.
+    try std.testing.expectEqual(@as(i16, 0), blosum62.score(nonres_code, 20)); // gap
+    try std.testing.expectEqual(@as(i16, 0), blosum62.score(nonres_code, 28)); // missing
+}
+
+test "blosum62: comptime degenerate scores match runtime setDegenerateScores" {
+    const allocator = std.testing.allocator;
+    // Clone blosum62 canonical into an owned mutable matrix and apply runtime degenerate scores.
+    const data_ptr = try allocator.create([Kp][Kp]i16);
+    defer allocator.destroy(data_ptr);
+    // Start from canonical-only data.
+    data_ptr.* = .{.{0} ** Kp} ** Kp;
+    for (0..20) |i| {
+        for (0..20) |j| {
+            data_ptr[i][j] = blosum62_canonical[i][j];
+        }
+    }
+
+    var sm = ScoreMatrix{
+        .data = data_ptr,
+        .name = "test",
+        .abc = &alphabet_mod.amino,
+        .owned = data_ptr,
+        .allocator = allocator,
+    };
+
+    sm.setDegenerateScores();
+
+    // Verify comptime degenerate scores match runtime for all degenerate positions.
+    const abc = alphabet_mod.amino;
+    const k: usize = abc.k;
+    const kp: usize = abc.kp;
+    // Check degenerate rows/columns (skip gap, nonresidue, missing which have different policy).
+    for (0..k) |i| {
+        var jp: usize = k + 1;
+        while (jp + 2 < kp) : (jp += 1) {
+            try std.testing.expectEqual(sm.data[i][jp], blosum62.data[i][jp]);
+        }
+    }
+    var ip: usize = k + 1;
+    while (ip + 2 < kp) : (ip += 1) {
+        for (0..k) |j| {
+            try std.testing.expectEqual(sm.data[ip][j], blosum62.data[ip][j]);
+        }
+        var jp: usize = k + 1;
+        while (jp + 2 < kp) : (jp += 1) {
+            try std.testing.expectEqual(sm.data[ip][jp], blosum62.data[ip][jp]);
+        }
+    }
 }
 
 test "identity: match and mismatch" {
