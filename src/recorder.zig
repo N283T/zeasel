@@ -10,20 +10,38 @@ pub const Recorder = struct {
     lines: std.ArrayList([]const u8),
     position: usize,
     allocator: Allocator,
+    max_lines: ?usize,
+    /// Total number of lines ever written (may exceed lines.items.len for bounded recorders).
+    total_written: usize,
 
-    /// Create a new recorder.
+    /// Create a new unbounded recorder.
     pub fn init(allocator: Allocator) Recorder {
         return .{
             .lines = .empty,
             .position = 0,
             .allocator = allocator,
+            .max_lines = null,
+            .total_written = 0,
+        };
+    }
+
+    /// Create a bounded recorder that keeps only the most recent `max` entries.
+    /// Uses a circular buffer approach: once full, the oldest entry is freed
+    /// and overwritten.
+    pub fn initBounded(allocator: Allocator, max: usize) Recorder {
+        return .{
+            .lines = .empty,
+            .position = 0,
+            .allocator = allocator,
+            .max_lines = max,
+            .total_written = 0,
         };
     }
 
     /// Record a line (takes ownership of a copy).
     pub fn recordLine(self: *Recorder, line: []const u8) !void {
         const copy = try self.allocator.dupe(u8, line);
-        try self.lines.append(self.allocator, copy);
+        try self.appendInternal(self.allocator, copy);
     }
 
     /// Read the next line from the recording, advancing position.
@@ -50,7 +68,7 @@ pub const Recorder = struct {
         self.position = 0;
     }
 
-    /// Number of recorded lines.
+    /// Number of recorded lines currently held.
     pub fn lineCount(self: Recorder) usize {
         return self.lines.items.len;
     }
@@ -60,7 +78,39 @@ pub const Recorder = struct {
     /// Modelled after Easel's esl_recorder_Read + manual append pattern.
     pub fn addLine(self: *Recorder, allocator: Allocator, line: []const u8) !void {
         const copy = try allocator.dupe(u8, line);
+        try self.appendInternal(allocator, copy);
+    }
+
+    /// Get a line by logical index. For bounded recorders the index is
+    /// relative to the current buffer contents (0 = oldest retained line).
+    pub fn getLine(self: Recorder, index: usize) ?[]const u8 {
+        if (index >= self.lines.items.len) return null;
+        return self.lines.items[index];
+    }
+
+    /// Internal helper: append an already-duped line, evicting the oldest
+    /// entry if the bounded capacity is reached.
+    fn appendInternal(self: *Recorder, allocator: Allocator, copy: []const u8) !void {
+        if (self.max_lines) |max| {
+            if (max == 0) {
+                // Zero capacity: discard immediately.
+                self.allocator.free(copy);
+                self.total_written += 1;
+                return;
+            }
+            if (self.lines.items.len >= max) {
+                // Evict the oldest entry (index 0) and shift left.
+                self.allocator.free(self.lines.items[0]);
+                std.mem.copyForwards([]const u8, self.lines.items[0 .. self.lines.items.len - 1], self.lines.items[1..self.lines.items.len]);
+                self.lines.items[self.lines.items.len - 1] = copy;
+                // Adjust position to stay valid after the shift.
+                if (self.position > 0) self.position -= 1;
+                self.total_written += 1;
+                return;
+            }
+        }
         try self.lines.append(allocator, copy);
+        self.total_written += 1;
     }
 
     /// Mark the current end-of-recording position as the start of a block.
@@ -220,4 +270,84 @@ test "getBlock: invalid mark returns error" {
 
     try rec.addLine(allocator, "only line");
     try std.testing.expectError(error.InvalidBlockMark, rec.getBlock(allocator, 999));
+}
+
+test "initBounded: keeps only most recent lines" {
+    const allocator = std.testing.allocator;
+    var rec = Recorder.initBounded(allocator, 3);
+    defer rec.deinit();
+
+    try rec.addLine(allocator, "A");
+    try rec.addLine(allocator, "B");
+    try rec.addLine(allocator, "C");
+    try std.testing.expectEqual(@as(usize, 3), rec.lineCount());
+
+    // Adding a 4th line should evict "A".
+    try rec.addLine(allocator, "D");
+    try std.testing.expectEqual(@as(usize, 3), rec.lineCount());
+    try std.testing.expectEqualStrings("B", rec.getLine(0).?);
+    try std.testing.expectEqualStrings("C", rec.getLine(1).?);
+    try std.testing.expectEqualStrings("D", rec.getLine(2).?);
+
+    // Adding another should evict "B".
+    try rec.addLine(allocator, "E");
+    try std.testing.expectEqual(@as(usize, 3), rec.lineCount());
+    try std.testing.expectEqualStrings("C", rec.getLine(0).?);
+    try std.testing.expectEqualStrings("D", rec.getLine(1).?);
+    try std.testing.expectEqualStrings("E", rec.getLine(2).?);
+}
+
+test "initBounded: total_written tracks all lines" {
+    const allocator = std.testing.allocator;
+    var rec = Recorder.initBounded(allocator, 2);
+    defer rec.deinit();
+
+    try rec.addLine(allocator, "1");
+    try rec.addLine(allocator, "2");
+    try rec.addLine(allocator, "3");
+    try rec.addLine(allocator, "4");
+
+    try std.testing.expectEqual(@as(usize, 4), rec.total_written);
+    try std.testing.expectEqual(@as(usize, 2), rec.lineCount());
+}
+
+test "initBounded: readLine works with eviction" {
+    const allocator = std.testing.allocator;
+    var rec = Recorder.initBounded(allocator, 2);
+    defer rec.deinit();
+
+    try rec.recordLine("first");
+    try rec.recordLine("second");
+    try rec.recordLine("third"); // evicts "first"
+
+    try std.testing.expectEqualStrings("second", rec.readLine().?);
+    try std.testing.expectEqualStrings("third", rec.readLine().?);
+    try std.testing.expectEqual(@as(?[]const u8, null), rec.readLine());
+}
+
+test "initBounded: zero capacity discards everything" {
+    const allocator = std.testing.allocator;
+    var rec = Recorder.initBounded(allocator, 0);
+    defer rec.deinit();
+
+    try rec.addLine(allocator, "ignored");
+    try rec.addLine(allocator, "also ignored");
+
+    try std.testing.expectEqual(@as(usize, 0), rec.lineCount());
+    try std.testing.expectEqual(@as(usize, 2), rec.total_written);
+}
+
+test "getLine: returns correct line by index" {
+    const allocator = std.testing.allocator;
+    var rec = Recorder.init(allocator);
+    defer rec.deinit();
+
+    try rec.addLine(allocator, "zero");
+    try rec.addLine(allocator, "one");
+    try rec.addLine(allocator, "two");
+
+    try std.testing.expectEqualStrings("zero", rec.getLine(0).?);
+    try std.testing.expectEqualStrings("one", rec.getLine(1).?);
+    try std.testing.expectEqualStrings("two", rec.getLine(2).?);
+    try std.testing.expect(rec.getLine(3) == null);
 }

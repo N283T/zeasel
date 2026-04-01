@@ -356,6 +356,47 @@ pub const EaselIndex = struct {
         return null;
     }
 
+    /// Compute subsequence byte offset for a sequence in the Easel index.
+    ///
+    /// Given a sequence name and 1-indexed start/end residue coordinates,
+    /// looks up the entry and computes the file byte offset using the
+    /// file's bpl (bytes per line) and rpl (residues per line):
+    ///   byte_offset = data_offset + ((start-1) / rpl) * bpl + ((start-1) % rpl)
+    ///
+    /// Returns the entry, the computed byte offset for the start position,
+    /// and the original end coordinate. Returns null if the key is not found
+    /// or coordinates are invalid.
+    pub fn findSubseq(self: *EaselIndex, allocator: Allocator, key: []const u8, start: u64, end: u64) !?struct { entry: SsiEntry, actual_offset: u64, end: u64 } {
+        if (start == 0 or end == 0) return null;
+        if (end < start) return null;
+
+        const entry = (try self.binarySearchPrimary(allocator, key)) orelse return null;
+        errdefer allocator.free(entry.name);
+
+        if (start > entry.seq_len or end > entry.seq_len) {
+            allocator.free(entry.name);
+            return null;
+        }
+
+        // Get bpl/rpl from file info for this entry's file.
+        if (entry.file_id >= self.files.len) {
+            allocator.free(entry.name);
+            return null;
+        }
+        const fi = self.files[entry.file_id];
+        if (fi.rpl == 0 or fi.bpl == 0) {
+            allocator.free(entry.name);
+            return null;
+        }
+
+        const residue_index = start - 1;
+        const actual_offset = entry.data_offset +
+            (residue_index / @as(u64, fi.rpl)) * @as(u64, fi.bpl) +
+            (residue_index % @as(u64, fi.rpl));
+
+        return .{ .entry = entry, .actual_offset = actual_offset, .end = end };
+    }
+
     /// Free all allocated memory and close the file handle.
     pub fn deinit(self: *EaselIndex) void {
         for (self.files) |f| self.allocator.free(f.name);
@@ -841,4 +882,58 @@ test "EaselIndex.findNumber: ordinal access" {
     // Out of range
     const missing = try idx.findNumber(allocator, 3);
     try std.testing.expect(missing == null);
+}
+
+test "EaselIndex.findSubseq: computes byte offset from bpl/rpl" {
+    const allocator = std.testing.allocator;
+
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(allocator);
+
+    // bpl=80, rpl=60 means 60 residues per line, 80 bytes per line (including newline etc.)
+    try writeEaselHeader(&buf, allocator, .{
+        .nprimary = 1,
+        .file_bpls = &.{80},
+        .file_rpls = &.{60},
+    });
+
+    try writePrimaryKey(&buf, allocator, .{ .key = "myseq", .r_off = 100, .d_off = 200, .len = 150 });
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.writeFile(.{ .sub_path = "subseq.ssi", .data = buf.items });
+
+    const file = try tmp_dir.dir.openFile("subseq.ssi", .{});
+    var idx = try EaselIndex.read(allocator, file);
+    defer idx.deinit();
+
+    // Start=1 (first residue): offset = 200 + (0/60)*80 + (0%60) = 200
+    {
+        const r = (try idx.findSubseq(allocator, "myseq", 1, 10)) orelse return error.ExpectedResult;
+        defer allocator.free(r.entry.name);
+        try std.testing.expectEqual(@as(u64, 200), r.actual_offset);
+    }
+
+    // Start=61 (first residue of second line): offset = 200 + (60/60)*80 + (60%60) = 280
+    {
+        const r = (try idx.findSubseq(allocator, "myseq", 61, 70)) orelse return error.ExpectedResult;
+        defer allocator.free(r.entry.name);
+        try std.testing.expectEqual(@as(u64, 280), r.actual_offset);
+    }
+
+    // Start=31 (middle of first line): offset = 200 + (30/60)*80 + (30%60) = 230
+    {
+        const r = (try idx.findSubseq(allocator, "myseq", 31, 40)) orelse return error.ExpectedResult;
+        defer allocator.free(r.entry.name);
+        try std.testing.expectEqual(@as(u64, 230), r.actual_offset);
+    }
+
+    // Invalid: start=0
+    try std.testing.expect((try idx.findSubseq(allocator, "myseq", 0, 10)) == null);
+
+    // Invalid: beyond seq_len
+    try std.testing.expect((try idx.findSubseq(allocator, "myseq", 1, 200)) == null);
+
+    // Invalid: key not found
+    try std.testing.expect((try idx.findSubseq(allocator, "missing", 1, 10)) == null);
 }

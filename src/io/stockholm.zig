@@ -137,17 +137,39 @@ pub fn parse(allocator: Allocator, abc: *const Alphabet, data: []const u8) !Msa 
 
     var ended = false;
 
+    // Block validation state for interleaved format.
+    var first_block_nseq: ?usize = null; // sequence count established by the first block
+    var block_seq_count: usize = 0; // sequences seen in current block
+    var block_seen = std.StringHashMap(void).init(allocator);
+    defer block_seen.deinit();
+
     while (lines.next()) |raw_line| {
         const line = std.mem.trimRight(u8, raw_line, "\r");
 
         // End of alignment record.
         if (std.mem.eql(u8, line, "//")) {
+            // Validate the final block has the expected count (if we saw any sequences).
+            if (first_block_nseq) |expected| {
+                if (block_seq_count != 0 and block_seq_count != expected) return error.InvalidFormat;
+            }
             ended = true;
             break;
         }
 
         // Blank line — block separator.
-        if (line.len == 0) continue;
+        if (line.len == 0) {
+            // Validate that the completed block has the expected sequence count.
+            if (block_seq_count > 0) {
+                if (first_block_nseq == null) {
+                    first_block_nseq = block_seq_count;
+                } else if (block_seq_count != first_block_nseq.?) {
+                    return error.InvalidFormat;
+                }
+            }
+            block_seq_count = 0;
+            block_seen.clearRetainingCapacity();
+            continue;
+        }
 
         // Markup lines.
         if (line[0] == '#') {
@@ -244,6 +266,11 @@ pub fn parse(allocator: Allocator, abc: *const Alphabet, data: []const u8) !Msa 
         const seq_text = trimLeft(line[name_end..]);
 
         if (seq_text.len == 0) return error.InvalidFormat;
+
+        // Check for duplicate sequence name within the same block.
+        if (block_seen.contains(seq_name)) return error.InvalidFormat;
+        try block_seen.put(seq_name, {});
+        block_seq_count += 1;
 
         if (name_index.get(seq_name)) |idx| {
             // Append to existing sequence.
@@ -1058,4 +1085,48 @@ test "parseAll: empty input returns empty slice" {
     defer allocator.free(msas);
 
     try testing.expectEqual(@as(usize, 0), msas.len);
+}
+
+test "parse: inconsistent block sequence count returns error" {
+    const allocator = testing.allocator;
+    const abc = &alphabet_mod.dna;
+
+    // First block has 2 sequences, second block has only 1.
+    const fewer =
+        \\# STOCKHOLM 1.0
+        \\
+        \\seq1  ACGT
+        \\seq2  ACGA
+        \\
+        \\seq1  TTTT
+        \\//
+    ;
+    try testing.expectError(error.InvalidFormat, parse(allocator, abc, fewer));
+
+    // First block has 1 sequence, second block has 2.
+    const more =
+        \\# STOCKHOLM 1.0
+        \\
+        \\seq1  ACGT
+        \\
+        \\seq1  TTTT
+        \\seq2  CCCC
+        \\//
+    ;
+    try testing.expectError(error.InvalidFormat, parse(allocator, abc, more));
+}
+
+test "parse: duplicate sequence name in same block returns error" {
+    const allocator = testing.allocator;
+    const abc = &alphabet_mod.dna;
+
+    // Same name appears twice in a single block.
+    const data =
+        \\# STOCKHOLM 1.0
+        \\
+        \\seq1  ACGT
+        \\seq1  TTTT
+        \\//
+    ;
+    try testing.expectError(error.InvalidFormat, parse(allocator, abc, data));
 }

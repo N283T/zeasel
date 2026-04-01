@@ -40,16 +40,19 @@ pub const Tree = struct {
     /// compared within the given tolerance.
     /// Uses the Goodman M(g) tree-mapping function via post-order traversal
     /// (see Easel esl_tree_Compare / Zmasek-Eddy 2001 SDI algorithm).
-    pub fn compare(self: Tree, other: Tree, tolerance: f64) bool {
+    /// Compare two trees for topological equivalence (heap-allocated version).
+    /// Returns error.OutOfMemory if allocation fails, or true/false for match.
+    pub fn compare(self: Tree, other: Tree, tolerance: f64) !bool {
         if (self.n_leaves != other.n_leaves) return false;
         if (self.n_nodes != other.n_nodes) return false;
 
         const n = self.n_leaves;
+        const alloc = self.allocator;
 
         // Build taxon mapping: for each leaf in self, find the matching leaf
         // in other by name. Both trees must have leaf names.
-        var taxa_map: [256]usize = undefined;
-        if (n > 256) return false;
+        const taxa_map = try alloc.alloc(usize, n);
+        defer alloc.free(taxa_map);
         for (0..n) |a| {
             const name_a = self.names[a] orelse return false;
             var found: ?usize = null;
@@ -66,19 +69,22 @@ pub const Tree = struct {
         // mg maps each node in self (leaf or internal) to the corresponding
         // node in other. For leaves, use taxa_map directly. For internal nodes,
         // compute via post-order traversal using the SDI algorithm.
-        var mg: [256]i32 = undefined;
-        if (self.n_nodes > 256) return false;
+        const mg = try alloc.alloc(i32, self.n_nodes);
+        defer alloc.free(mg);
 
         // Initialize leaf mappings.
         for (0..n) |i| mg[i] = @intCast(taxa_map[i]);
 
         // Post-order traversal using a stack.
-        var order: [256]usize = undefined;
+        const order = try alloc.alloc(usize, self.n_nodes);
+        defer alloc.free(order);
         var order_len: usize = 0;
         {
-            var stack: [256]usize = undefined;
-            var visited: [256]bool = undefined;
-            for (0..self.n_nodes) |i| visited[i] = false;
+            const stack = try alloc.alloc(usize, self.n_nodes);
+            defer alloc.free(stack);
+            const visited = try alloc.alloc(bool, self.n_nodes);
+            defer alloc.free(visited);
+            @memset(visited, false);
             // Find root.
             var root: usize = 0;
             for (0..self.n_nodes) |i| {
@@ -984,7 +990,7 @@ test "compare: identical trees are equal" {
     defer t1.deinit();
     var t2 = try upgma(allocator, &dist, 3, &names);
     defer t2.deinit();
-    try std.testing.expect(t1.compare(t2, 1e-6));
+    try std.testing.expect(try t1.compare(t2, 1e-6));
 }
 
 test "compare: different topologies are not equal" {
@@ -993,7 +999,7 @@ test "compare: different topologies are not equal" {
     defer t1.deinit();
     var t2 = try readNewick(allocator, "((A:0.1,C:0.2):0.3,B:0.4);");
     defer t2.deinit();
-    try std.testing.expect(!t1.compare(t2, 1e-6));
+    try std.testing.expect(!try t1.compare(t2, 1e-6));
 }
 
 test "compare: same topology different branch lengths fails strict tolerance" {
@@ -1002,8 +1008,8 @@ test "compare: same topology different branch lengths fails strict tolerance" {
     defer t1.deinit();
     var t2 = try readNewick(allocator, "((A:0.5,B:0.2):0.3,C:0.4);");
     defer t2.deinit();
-    try std.testing.expect(!t1.compare(t2, 1e-6));
-    try std.testing.expect(t1.compare(t2, 1.0));
+    try std.testing.expect(!try t1.compare(t2, 1e-6));
+    try std.testing.expect(try t1.compare(t2, 1.0));
 }
 
 test "compare: round-trip Newick preserves topology" {
@@ -1022,7 +1028,7 @@ test "compare: round-trip Newick preserves topology" {
 
     var t2 = try readNewick(allocator, buf.items);
     defer t2.deinit();
-    try std.testing.expect(t1.compare(t2, 1e-6));
+    try std.testing.expect(try t1.compare(t2, 1e-6));
 }
 
 test "simulate: random tree structure is valid" {

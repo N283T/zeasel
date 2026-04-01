@@ -1,7 +1,9 @@
 // zeasel-seqfetch: fetch specific sequences by name from a file.
 //
 // Usage: zeasel-seqfetch <seqfile> <name1> [name2] ...
+//        zeasel-seqfetch --index <seqfile>
 // Outputs matching sequences in FASTA format to stdout.
+// With --index, builds a .ssi index file for the given FASTA file.
 
 const std = @import("std");
 const zeasel = @import("zeasel");
@@ -14,8 +16,25 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
+    if (args.len < 2) {
+        std.debug.print("Usage: zeasel-seqfetch <seqfile> <name1> [name2] ...\n", .{});
+        std.debug.print("       zeasel-seqfetch --index <seqfile>\n", .{});
+        std.process.exit(1);
+    }
+
+    // Handle --index mode.
+    if (std.mem.eql(u8, args[1], "--index")) {
+        if (args.len < 3) {
+            std.debug.print("Usage: zeasel-seqfetch --index <seqfile>\n", .{});
+            std.process.exit(1);
+        }
+        try buildIndex(allocator, args[2]);
+        return;
+    }
+
     if (args.len < 3) {
         std.debug.print("Usage: zeasel-seqfetch <seqfile> <name1> [name2] ...\n", .{});
+        std.debug.print("       zeasel-seqfetch --index <seqfile>\n", .{});
         std.process.exit(1);
     }
 
@@ -82,4 +101,31 @@ pub fn main() !void {
         std.debug.print("No sequences matched.\n", .{});
         std.process.exit(1);
     }
+}
+
+/// Build an SSI index for a FASTA file and write it to <path>.ssi.
+fn buildIndex(allocator: std.mem.Allocator, path: []const u8) !void {
+    // Read the FASTA file.
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+    const data = try file.readToEndAlloc(allocator, 512 * 1024 * 1024);
+    defer allocator.free(data);
+
+    // Build the index.
+    var index = try zeasel.ssi.ZeaselIndex.buildFromFasta(allocator, data);
+    defer index.deinit();
+
+    // Write to <path>.ssi.
+    const ssi_path = try std.fmt.allocPrint(allocator, "{s}.ssi", .{path});
+    defer allocator.free(ssi_path);
+
+    const out_file = try std.fs.cwd().createFile(ssi_path, .{});
+    defer out_file.close();
+
+    // TODO(M1): deprecatedWriter() is deprecated; migrate once the codebase
+    // adopts the new std.Io.Writer API.
+    const writer = out_file.deprecatedWriter();
+    try index.write(writer.any());
+
+    std.debug.print("SSI index written to {s} ({d} entries)\n", .{ ssi_path, index.entries.len });
 }

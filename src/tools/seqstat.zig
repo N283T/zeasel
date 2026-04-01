@@ -1,7 +1,7 @@
 // zeasel-seqstat: report statistics about sequences in a file.
 // Equivalent to Easel's esl-seqstat.
 //
-// Usage: zeasel-seqstat <seqfile>
+// Usage: zeasel-seqstat [-a] <seqfile>
 
 const std = @import("std");
 const zeasel = @import("zeasel");
@@ -15,11 +15,28 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     if (args.len < 2) {
-        std.debug.print("Usage: zeasel-seqstat <seqfile>\n", .{});
+        std.debug.print("Usage: zeasel-seqstat [-a] <seqfile>\n", .{});
         std.process.exit(1);
     }
 
-    const path = args[1];
+    // Parse optional flags.
+    var show_per_seq = false;
+    var positional_start: usize = 1;
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "-a")) {
+            show_per_seq = true;
+            positional_start += 1;
+        } else {
+            break;
+        }
+    }
+
+    if (positional_start >= args.len) {
+        std.debug.print("Usage: zeasel-seqstat [-a] <seqfile>\n", .{});
+        std.process.exit(1);
+    }
+
+    const path = args[positional_start];
 
     // Read entire file into memory.
     const file = try std.fs.cwd().openFile(path, .{});
@@ -62,6 +79,15 @@ pub fn main() !void {
     if (sequences.len == 0) {
         try stdout.print("No sequences found.\n", .{});
         return;
+    }
+
+    // Per-sequence info (when -a is set).
+    if (show_per_seq) {
+        for (sequences) |seq| {
+            const desc = seq.description orelse "";
+            try stdout.print("= {s} {d} {s}\n", .{ seq.name, seq.len(), desc });
+        }
+        try stdout.print("\n", .{});
     }
 
     // Accumulate statistics.

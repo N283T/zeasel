@@ -553,6 +553,90 @@ fn biUpdateWorkspaceBlue(
     l_out.* = l;
 }
 
+/// Random bipartite independent pair (biRandom).
+///
+/// Randomly assigns each vertex to S with probability `t_prob`, then
+/// eligible vertices (not linked to any S member) go to T.
+/// Reference: Easel esl_iset_biRandom().
+///
+/// Returns .s[0..n] and .t[0..n] boolean arrays. Caller owns both slices.
+pub fn biRandom(
+    allocator: Allocator,
+    n: usize,
+    linkfn: LinkFn,
+    data: ?*anyopaque,
+    t_prob: f64,
+    rng: *Random,
+) !struct { s: []bool, t: []bool } {
+    const s = try allocator.alloc(bool, n);
+    errdefer allocator.free(s);
+    const t = try allocator.alloc(bool, n);
+    errdefer allocator.free(t);
+    @memset(s, false);
+    @memset(t, false);
+
+    // Phase 1: randomly assign vertices to S with probability t_prob.
+    for (0..n) |i| {
+        if (rng.uniform() < t_prob) {
+            s[i] = true;
+        }
+    }
+
+    // Phase 2: assign eligible vertices to T.
+    // A vertex is eligible for T if it is not in S and not linked to any S member.
+    for (0..n) |i| {
+        if (s[i]) continue;
+        var linked_to_s = false;
+        for (0..n) |j| {
+            if (s[j] and linkfn(i, j, data)) {
+                linked_to_s = true;
+                break;
+            }
+        }
+        if (!linked_to_s) {
+            t[i] = true;
+        }
+    }
+
+    return .{ .s = s, .t = t };
+}
+
+/// Validate a mono independent set: no two assigned vertices are linked.
+///
+/// Returns true if assignment is a valid independent set.
+pub fn monoValidate(n: usize, linkfn: LinkFn, data: ?*anyopaque, assignment: []const u8) bool {
+    if (assignment.len < n) return false;
+    for (0..n) |i| {
+        if (assignment[i] == 0) continue;
+        for (i + 1..n) |j| {
+            if (assignment[j] == 0) continue;
+            if (linkfn(i, j, data)) return false;
+        }
+    }
+    return true;
+}
+
+/// Validate a bipartite independent pair: S and T are each valid
+/// independent sets and no S-T cross-links exist.
+///
+/// Returns true if s and t form a valid bipartite independent pair.
+pub fn biValidate(n: usize, linkfn: LinkFn, data: ?*anyopaque, s: []const bool, t: []const bool) bool {
+    if (s.len < n or t.len < n) return false;
+    for (0..n) |i| {
+        for (i + 1..n) |j| {
+            if (!linkfn(i, j, data)) continue;
+            // No two S members may be linked.
+            if (s[i] and s[j]) return false;
+            // No two T members may be linked.
+            if (t[i] and t[j]) return false;
+            // No S-T cross-links.
+            if (s[i] and t[j]) return false;
+            if (t[i] and s[j]) return false;
+        }
+    }
+    return true;
+}
+
 // --- Legacy API (distance-matrix based) ---
 
 /// Split n items into two quasi-independent sets based on a pairwise
@@ -968,4 +1052,73 @@ test "countIntraPairs: basic" {
 
     try std.testing.expectEqual(@as(usize, 1), result.a);
     try std.testing.expectEqual(@as(usize, 0), result.b);
+}
+
+test "biRandom: produces valid bipartite independent pair" {
+    const allocator = std.testing.allocator;
+    var rng = Random.init(42);
+
+    const result = try biRandom(allocator, 6, chainLink, null, 0.3, &rng);
+    defer allocator.free(result.s);
+    defer allocator.free(result.t);
+
+    // No vertex can be in both S and T.
+    for (0..6) |i| {
+        try std.testing.expect(!(result.s[i] and result.t[i]));
+    }
+
+    // No S-T cross-links.
+    for (0..6) |i| {
+        for (0..6) |j| {
+            if (chainLink(i, j, null)) {
+                try std.testing.expect(!(result.s[i] and result.t[j]));
+            }
+        }
+    }
+}
+
+test "biRandom: no links — all non-S vertices go to T" {
+    const allocator = std.testing.allocator;
+    var rng = Random.init(7);
+
+    const noLink = struct {
+        fn f(_: usize, _: usize, _: ?*anyopaque) bool {
+            return false;
+        }
+    }.f;
+
+    const result = try biRandom(allocator, 4, noLink, null, 0.5, &rng);
+    defer allocator.free(result.s);
+    defer allocator.free(result.t);
+
+    // Every non-S vertex should be in T when there are no links.
+    for (0..4) |i| {
+        if (!result.s[i]) {
+            try std.testing.expect(result.t[i]);
+        }
+    }
+}
+
+test "monoValidate: valid independent set" {
+    const result = [_]u8{ 1, 0, 1, 0, 1 };
+    try std.testing.expect(monoValidate(5, chainLink, null, &result));
+}
+
+test "monoValidate: invalid — adjacent elements both assigned" {
+    const result = [_]u8{ 1, 1, 0, 0, 0 };
+    try std.testing.expect(!monoValidate(5, chainLink, null, &result));
+}
+
+test "biValidate: valid bipartite independent pair" {
+    // Chain 0-1-2-3-4. S={0,2,4}, T={} is valid; S={0,4}, T={2} is valid.
+    const s = [_]bool{ true, false, false, false, true };
+    const t = [_]bool{ false, false, true, false, false };
+    try std.testing.expect(biValidate(5, chainLink, null, &s, &t));
+}
+
+test "biValidate: invalid — S-T cross-link" {
+    // 0-1 are linked; S={0}, T={1} is invalid.
+    const s = [_]bool{ true, false, false, false, false };
+    const t = [_]bool{ false, true, false, false, false };
+    try std.testing.expect(!biValidate(5, chainLink, null, &s, &t));
 }

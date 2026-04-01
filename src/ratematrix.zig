@@ -155,6 +155,66 @@ pub fn setKimura(allocator: Allocator, alpha: f64, beta: f64) !Matrix {
     return q;
 }
 
+/// F81 model (Felsenstein, 1981) for DNA (4x4).
+/// Off-diagonal Q[i][j] = pi[j]; diagonal set so rows sum to zero.
+/// Normalized to 1 expected substitution/site per unit time.
+/// DNA alphabet order: A=0, C=1, G=2, T=3.
+/// Caller owns the returned Matrix.
+pub fn setF81(allocator: Allocator, pi: [4]f64) !Matrix {
+    var q = try Matrix.init(allocator, 4, 4);
+    errdefer q.deinit();
+
+    for (0..4) |i| {
+        var row_sum: f64 = 0;
+        for (0..4) |j| {
+            if (i != j) {
+                q.set(i, j, pi[j]);
+                row_sum += pi[j];
+            }
+        }
+        q.set(i, i, -row_sum);
+    }
+
+    // Normalize to 1 substitution/site
+    var pi_slice: [4]f64 = pi;
+    try normalize(&q, &pi_slice);
+
+    return q;
+}
+
+/// HKY model (Hasegawa-Kishino-Yano, 1985) for DNA (4x4).
+/// `alpha` = transition rate, `beta` = transversion rate.
+/// Q[i][j] = alpha * pi[j] for transitions (A<->G, C<->T),
+///           beta * pi[j]  for transversions.
+/// Diagonal set so rows sum to zero.
+/// Normalized to 1 expected substitution/site per unit time.
+/// DNA alphabet order: A=0, C=1, G=2, T=3.
+/// Transitions: (0,2), (2,0), (1,3), (3,1); all others are transversions.
+/// Caller owns the returned Matrix.
+pub fn setHKY(allocator: Allocator, alpha: f64, beta: f64, pi: [4]f64) !Matrix {
+    var q = try Matrix.init(allocator, 4, 4);
+    errdefer q.deinit();
+
+    for (0..4) |i| {
+        var row_sum: f64 = 0;
+        for (0..4) |j| {
+            if (i != j) {
+                // (i+j)%2 == 0 => transition (A<->G: 0+2=2, C<->T: 1+3=4)
+                const rate = if ((i + j) % 2 == 0) alpha * pi[j] else beta * pi[j];
+                q.set(i, j, rate);
+                row_sum += rate;
+            }
+        }
+        q.set(i, i, -row_sum);
+    }
+
+    // Normalize to 1 substitution/site
+    var pi_slice: [4]f64 = pi;
+    try normalize(&q, &pi_slice);
+
+    return q;
+}
+
 /// WAG amino acid exchangeability parameters (Whelan & Goldman, 2001).
 /// 190 values in lower-triangular order: for i=1..19, j=0..i-1.
 const wag_exchangeabilities: [190]f64 = .{
@@ -439,6 +499,130 @@ test "setKimura: transition/transversion asymmetry" {
     var rate: f64 = 0;
     for (0..4) |i| rate -= 0.25 * q.get(i, i);
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), rate, 1e-10);
+}
+
+test "setF81: uniform pi reduces to JC" {
+    const allocator = std.testing.allocator;
+    var jc = try setJukesCantor(allocator, 4);
+    defer jc.deinit();
+    var f81 = try setF81(allocator, .{ 0.25, 0.25, 0.25, 0.25 });
+    defer f81.deinit();
+
+    for (0..4) |i| {
+        for (0..4) |j| {
+            try std.testing.expectApproxEqAbs(jc.get(i, j), f81.get(i, j), 1e-10);
+        }
+    }
+}
+
+test "setF81: valid rate matrix with non-uniform pi" {
+    const allocator = std.testing.allocator;
+    const pi = [_]f64{ 0.1, 0.2, 0.3, 0.4 };
+    var q = try setF81(allocator, pi);
+    defer q.deinit();
+
+    try std.testing.expect(isValid(q, 1e-10));
+
+    // Expected rate = 1.0
+    var rate: f64 = 0;
+    for (0..4) |i| rate -= pi[i] * q.get(i, i);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), rate, 1e-10);
+}
+
+test "setF81: detailed balance" {
+    const allocator = std.testing.allocator;
+    const pi = [_]f64{ 0.1, 0.2, 0.3, 0.4 };
+    var q = try setF81(allocator, pi);
+    defer q.deinit();
+
+    // Detailed balance: pi[i]*Q[i][j] = pi[j]*Q[j][i]
+    for (0..4) |i| {
+        for (0..4) |j| {
+            if (i != j) {
+                const lhs = pi[i] * q.get(i, j);
+                const rhs = pi[j] * q.get(j, i);
+                try std.testing.expectApproxEqRel(lhs, rhs, 1e-10);
+            }
+        }
+    }
+}
+
+test "setHKY: uniform pi with alpha=beta reduces to JC" {
+    const allocator = std.testing.allocator;
+    var jc = try setJukesCantor(allocator, 4);
+    defer jc.deinit();
+    var hky = try setHKY(allocator, 1.0, 1.0, .{ 0.25, 0.25, 0.25, 0.25 });
+    defer hky.deinit();
+
+    for (0..4) |i| {
+        for (0..4) |j| {
+            try std.testing.expectApproxEqAbs(jc.get(i, j), hky.get(i, j), 1e-10);
+        }
+    }
+}
+
+test "setHKY: uniform pi reduces to Kimura" {
+    const allocator = std.testing.allocator;
+    var kim = try setKimura(allocator, 2.0, 1.0);
+    defer kim.deinit();
+    var hky = try setHKY(allocator, 2.0, 1.0, .{ 0.25, 0.25, 0.25, 0.25 });
+    defer hky.deinit();
+
+    for (0..4) |i| {
+        for (0..4) |j| {
+            try std.testing.expectApproxEqAbs(kim.get(i, j), hky.get(i, j), 1e-10);
+        }
+    }
+}
+
+test "setHKY: valid rate matrix with non-uniform pi" {
+    const allocator = std.testing.allocator;
+    const pi = [_]f64{ 0.1, 0.2, 0.3, 0.4 };
+    var q = try setHKY(allocator, 2.0, 1.0, pi);
+    defer q.deinit();
+
+    try std.testing.expect(isValid(q, 1e-10));
+
+    // Expected rate = 1.0
+    var rate: f64 = 0;
+    for (0..4) |i| rate -= pi[i] * q.get(i, i);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), rate, 1e-10);
+
+    // Transition rate (A->G) should be higher than transversion (A->C)
+    try std.testing.expect(q.get(0, 2) > q.get(0, 1));
+}
+
+test "setHKY: detailed balance" {
+    const allocator = std.testing.allocator;
+    const pi = [_]f64{ 0.1, 0.2, 0.3, 0.4 };
+    var q = try setHKY(allocator, 2.0, 1.0, pi);
+    defer q.deinit();
+
+    // Detailed balance: pi[i]*Q[i][j] = pi[j]*Q[j][i]
+    for (0..4) |i| {
+        for (0..4) |j| {
+            if (i != j) {
+                const lhs = pi[i] * q.get(i, j);
+                const rhs = pi[j] * q.get(j, i);
+                try std.testing.expectApproxEqRel(lhs, rhs, 1e-10);
+            }
+        }
+    }
+}
+
+test "setHKY: alpha=beta reduces to F81" {
+    const allocator = std.testing.allocator;
+    const pi = [_]f64{ 0.1, 0.2, 0.3, 0.4 };
+    var f81 = try setF81(allocator, pi);
+    defer f81.deinit();
+    var hky = try setHKY(allocator, 1.0, 1.0, pi);
+    defer hky.deinit();
+
+    for (0..4) |i| {
+        for (0..4) |j| {
+            try std.testing.expectApproxEqAbs(f81.get(i, j), hky.get(i, j), 1e-10);
+        }
+    }
 }
 
 test "setWAG: valid rate matrix with default frequencies" {
