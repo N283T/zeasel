@@ -50,6 +50,9 @@ pub fn parseToPairs(allocator: Allocator, wuss: []const u8) ![]i32 {
     defer for (&stacks) |*s| s.deinit(allocator);
 
     for (wuss, 0..) |ch, i| {
+        // Reject non-printable characters, matching Easel's validation.
+        if (ch < 0x20 or ch > 0x7E) return error.InvalidCharacter;
+
         if (isOpenBracket(ch)) {
             const kind = bracketKind(ch);
             if (kind >= MAX_KINDS) continue;
@@ -61,7 +64,7 @@ pub fn parseToPairs(allocator: Allocator, wuss: []const u8) ![]i32 {
             pairs[open_pos] = @intCast(i);
             pairs[i] = @intCast(open_pos);
         }
-        // Unpaired characters (. - _ ~) leave pairs[i] = -1.
+        // Unpaired printable characters (. - _ ~ etc.) leave pairs[i] = -1.
     }
 
     // All stacks must be empty for balanced notation.
@@ -88,19 +91,23 @@ pub fn pairsToSimple(allocator: Allocator, pairs: []const i32) ![]u8 {
 }
 
 /// Count the number of base pairs (each pair counted once, via open brackets).
-pub fn countPairs(wuss: []const u8) usize {
+/// Returns error.InvalidCharacter for non-printable characters.
+pub fn countPairs(wuss: []const u8) !usize {
     var count: usize = 0;
     for (wuss) |ch| {
+        if (ch < 0x20 or ch > 0x7E) return error.InvalidCharacter;
         if (isOpenBracket(ch)) count += 1;
     }
     return count;
 }
 
 /// Return true if all brackets in wuss are balanced.
-pub fn validate(wuss: []const u8) bool {
+/// Returns error.InvalidCharacter for non-printable characters.
+pub fn validate(wuss: []const u8) !bool {
     const MAX_KINDS = 30;
     var depth: [MAX_KINDS]usize = @splat(0);
     for (wuss) |ch| {
+        if (ch < 0x20 or ch > 0x7E) return error.InvalidCharacter;
         if (isOpenBracket(ch)) {
             const kind = bracketKind(ch);
             if (kind < MAX_KINDS) depth[kind] += 1;
@@ -284,28 +291,46 @@ test "parseToPairs: unbalanced returns error" {
     try std.testing.expectError(error.UnbalancedBrackets, parseToPairs(allocator, ".)"));
 }
 
+test "parseToPairs: non-printable characters rejected" {
+    const allocator = std.testing.allocator;
+    // Control character (0x01) should be rejected
+    try std.testing.expectError(error.InvalidCharacter, parseToPairs(allocator, "((\x01..))"));
+    // DEL (0x7F) should be rejected
+    try std.testing.expectError(error.InvalidCharacter, parseToPairs(allocator, "((\x7F..))"));
+    // High byte (0x80) should be rejected
+    try std.testing.expectError(error.InvalidCharacter, parseToPairs(allocator, "((\x80..))"));
+}
+
 test "countPairs: two nested pairs" {
-    try std.testing.expectEqual(@as(usize, 2), countPairs("((....))"));
+    try std.testing.expectEqual(@as(usize, 2), try countPairs("((....))"));
 }
 
 test "countPairs: zero pairs" {
-    try std.testing.expectEqual(@as(usize, 0), countPairs("...."));
+    try std.testing.expectEqual(@as(usize, 0), try countPairs("...."));
 }
 
 test "countPairs: mixed brackets" {
-    try std.testing.expectEqual(@as(usize, 2), countPairs("<()>"));
+    try std.testing.expectEqual(@as(usize, 2), try countPairs("<()>"));
+}
+
+test "countPairs: non-printable character rejected" {
+    try std.testing.expectError(error.InvalidCharacter, countPairs("((\x01..))"));
 }
 
 test "validate: balanced strings" {
-    try std.testing.expect(validate("((....))"));
-    try std.testing.expect(validate("...."));
-    try std.testing.expect(validate("<()>"));
-    try std.testing.expect(validate(""));
+    try std.testing.expect(try validate("((....))"));
+    try std.testing.expect(try validate("...."));
+    try std.testing.expect(try validate("<()>"));
+    try std.testing.expect(try validate(""));
 }
 
 test "validate: unbalanced strings" {
-    try std.testing.expect(!validate("((.)"));
-    try std.testing.expect(!validate(".)"));
+    try std.testing.expect(!try validate("((.)"));
+    try std.testing.expect(!try validate(".)"));
+}
+
+test "validate: non-printable character rejected" {
+    try std.testing.expectError(error.InvalidCharacter, validate("((\x7F..))"));
 }
 
 test "pairsToSimple: round-trip from ((....))'" {
