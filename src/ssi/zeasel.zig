@@ -309,6 +309,223 @@ pub const ZeaselIndex = struct {
     }
 };
 
+/// Maximum number of entries before returning error.TooManyKeys.
+/// External sort for larger indexes can be implemented later.
+pub const MAX_BUILDER_ENTRIES: usize = 10_000_000;
+
+/// Incremental SSI index builder.
+///
+/// Allows adding entries from arbitrary formats one at a time,
+/// registering multiple source files, and adding aliases.
+/// Call `build()` to produce a `ZeaselIndex` or `write()` to
+/// serialise directly without an intermediate in-memory index.
+pub const IndexBuilder = struct {
+    allocator: Allocator,
+    entries: std.ArrayList(Entry),
+    aliases: std.ArrayList(Alias),
+    file_names: std.ArrayList([]const u8),
+
+    pub const Entry = struct {
+        name: []const u8,
+        offset: u64,
+        data_offset: u64,
+        seq_len: u64,
+        file_id: u16,
+    };
+
+    pub const Alias = struct {
+        alias: []const u8,
+        target: []const u8,
+    };
+
+    pub fn init(allocator: Allocator) IndexBuilder {
+        return .{
+            .allocator = allocator,
+            .entries = std.ArrayList(Entry){},
+            .aliases = std.ArrayList(Alias){},
+            .file_names = std.ArrayList([]const u8){},
+        };
+    }
+
+    /// Register a source file. Returns the file_id (0-indexed).
+    pub fn addFile(self: *IndexBuilder, filename: []const u8) !u16 {
+        const name_copy = try self.allocator.dupe(u8, filename);
+        errdefer self.allocator.free(name_copy);
+        try self.file_names.append(self.allocator, name_copy);
+        return @intCast(self.file_names.items.len - 1);
+    }
+
+    /// Add a primary key entry.
+    pub fn addKey(self: *IndexBuilder, name: []const u8, file_id: u16, offset: u64, data_offset: u64, seq_len: u64) !void {
+        if (self.entries.items.len >= MAX_BUILDER_ENTRIES) return error.TooManyKeys;
+        const name_copy = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(name_copy);
+        try self.entries.append(self.allocator, .{
+            .name = name_copy,
+            .offset = offset,
+            .data_offset = data_offset,
+            .seq_len = seq_len,
+            .file_id = file_id,
+        });
+    }
+
+    /// Add an alias (secondary key pointing to a primary key name).
+    pub fn addAlias(self: *IndexBuilder, alias: []const u8, primary: []const u8) !void {
+        const alias_copy = try self.allocator.dupe(u8, alias);
+        errdefer self.allocator.free(alias_copy);
+        const target_copy = try self.allocator.dupe(u8, primary);
+        errdefer self.allocator.free(target_copy);
+        try self.aliases.append(self.allocator, .{
+            .alias = alias_copy,
+            .target = target_copy,
+        });
+    }
+
+    /// Sort entries by name and check for duplicate primary keys.
+    /// Returns error.DuplicateKey if any two entries share a name.
+    fn validateAndSort(self: *IndexBuilder) !void {
+        const items = self.entries.items;
+        std.mem.sort(Entry, items, {}, struct {
+            fn lessThan(_: void, a: Entry, b: Entry) bool {
+                return std.mem.order(u8, a.name, b.name) == .lt;
+            }
+        }.lessThan);
+        // Check adjacent pairs for duplicates.
+        if (items.len > 1) {
+            for (0..items.len - 1) |i| {
+                if (std.mem.eql(u8, items[i].name, items[i + 1].name)) {
+                    return error.DuplicateKey;
+                }
+            }
+        }
+    }
+
+    /// Build a `ZeaselIndex` from the accumulated entries.
+    /// Validates uniqueness of primary keys. Caller owns the returned index.
+    pub fn build(self: *IndexBuilder) !ZeaselIndex {
+        try self.validateAndSort();
+
+        // Transfer entries into SsiEntry slice.
+        const entries = try self.allocator.alloc(SsiEntry, self.entries.items.len);
+        errdefer {
+            for (entries) |e| self.allocator.free(e.name);
+            self.allocator.free(entries);
+        }
+
+        for (self.entries.items, 0..) |be, i| {
+            entries[i] = SsiEntry{
+                .name = try self.allocator.dupe(u8, be.name),
+                .offset = be.offset,
+                .data_offset = be.data_offset,
+                .seq_len = be.seq_len,
+                .file_id = be.file_id,
+            };
+        }
+
+        // Build name_map.
+        var name_map = std.StringHashMap(usize).init(self.allocator);
+        errdefer name_map.deinit();
+        for (entries, 0..) |e, i| {
+            try name_map.put(e.name, i);
+        }
+
+        // Build alias_map: resolve alias -> primary entry index.
+        var alias_map = std.StringHashMap(usize).init(self.allocator);
+        errdefer {
+            var ait = alias_map.keyIterator();
+            while (ait.next()) |k| self.allocator.free(k.*);
+            alias_map.deinit();
+        }
+        for (self.aliases.items) |a| {
+            const idx = name_map.get(a.target) orelse return error.KeyNotFound;
+            const alias_copy = try self.allocator.dupe(u8, a.alias);
+            errdefer self.allocator.free(alias_copy);
+            try alias_map.put(alias_copy, idx);
+        }
+
+        // Copy file names.
+        var file_names: [][]const u8 = &.{};
+        if (self.file_names.items.len > 0) {
+            file_names = try self.allocator.alloc([]const u8, self.file_names.items.len);
+            var files_done: usize = 0;
+            errdefer {
+                for (0..files_done) |fi| self.allocator.free(file_names[fi]);
+                self.allocator.free(file_names);
+            }
+            for (self.file_names.items, 0..) |fname, fi| {
+                file_names[fi] = try self.allocator.dupe(u8, fname);
+                files_done += 1;
+            }
+        }
+
+        return ZeaselIndex{
+            .entries = entries,
+            .name_map = name_map,
+            .alias_map = alias_map,
+            .file_names = file_names,
+            .allocator = self.allocator,
+        };
+    }
+
+    /// Write the index directly to a binary stream in zeasel SSI v2 format,
+    /// without building an intermediate ZeaselIndex.
+    /// Validates uniqueness of primary keys.
+    pub fn write(self: *IndexBuilder, dest: std.io.AnyWriter) !void {
+        try self.validateAndSort();
+
+        // To write aliases we need to resolve target names to sorted entry indices.
+        // Build a temporary name->index map.
+        var name_map = std.StringHashMap(usize).init(self.allocator);
+        defer name_map.deinit();
+        for (self.entries.items, 0..) |e, i| {
+            try name_map.put(e.name, i);
+        }
+
+        // Header
+        try dest.writeAll(MAGIC);
+        try dest.writeInt(u32, VERSION, .little);
+        try dest.writeInt(u64, @intCast(self.entries.items.len), .little);
+        try dest.writeInt(u32, @intCast(self.file_names.items.len), .little);
+        try dest.writeInt(u32, @intCast(self.aliases.items.len), .little);
+
+        // Entries (sorted)
+        for (self.entries.items) |e| {
+            try dest.writeInt(u32, @intCast(e.name.len), .little);
+            try dest.writeAll(e.name);
+            try dest.writeInt(u64, e.offset, .little);
+            try dest.writeInt(u64, e.data_offset, .little);
+            try dest.writeInt(u64, e.seq_len, .little);
+            try dest.writeInt(u16, e.file_id, .little);
+        }
+
+        // File names
+        for (self.file_names.items) |fname| {
+            try dest.writeInt(u32, @intCast(fname.len), .little);
+            try dest.writeAll(fname);
+        }
+
+        // Aliases
+        for (self.aliases.items) |a| {
+            const idx = name_map.get(a.target) orelse return error.KeyNotFound;
+            try dest.writeInt(u32, @intCast(a.alias.len), .little);
+            try dest.writeAll(a.alias);
+            try dest.writeInt(u64, @intCast(idx), .little);
+        }
+    }
+
+    pub fn deinit(self: *IndexBuilder) void {
+        for (self.entries.items) |e| self.allocator.free(e.name);
+        self.entries.deinit(self.allocator);
+        for (self.aliases.items) |a| {
+            self.allocator.free(a.alias);
+            self.allocator.free(a.target);
+        }
+        self.aliases.deinit(self.allocator);
+        for (self.file_names.items) |f| self.allocator.free(f);
+        self.file_names.deinit(self.allocator);
+    }
+};
+
 // --- Tests ---
 
 // Use ZeaselIndex directly for tests (SsiIndex is now a tagged union).
@@ -488,4 +705,174 @@ test "buildFromFasta: sequence with description" {
 
     try std.testing.expectEqualStrings("seq1", idx.entries[0].name);
     try std.testing.expectEqual(@as(u64, 4), idx.entries[0].seq_len);
+}
+
+// --- IndexBuilder tests ---
+
+test "IndexBuilder: build from incremental additions" {
+    const allocator = std.testing.allocator;
+
+    var builder = IndexBuilder.init(allocator);
+    defer builder.deinit();
+
+    _ = try builder.addFile("test.fasta");
+    try builder.addKey("seq1", 0, 0, 5, 100);
+    try builder.addKey("seq2", 0, 200, 205, 150);
+
+    var idx = try builder.build();
+    defer idx.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), idx.entries.len);
+
+    const e1 = idx.lookup("seq1") orelse return error.TestEntryNotFound;
+    try std.testing.expectEqual(@as(u64, 100), e1.seq_len);
+    try std.testing.expectEqual(@as(u64, 5), e1.data_offset);
+
+    const e2 = idx.lookup("seq2") orelse return error.TestEntryNotFound;
+    try std.testing.expectEqual(@as(u64, 150), e2.seq_len);
+}
+
+test "IndexBuilder: duplicate key detection" {
+    const allocator = std.testing.allocator;
+
+    var builder = IndexBuilder.init(allocator);
+    defer builder.deinit();
+
+    _ = try builder.addFile("test.fasta");
+    try builder.addKey("seq1", 0, 0, 5, 100);
+    try builder.addKey("seq1", 0, 200, 205, 150);
+
+    try std.testing.expectError(error.DuplicateKey, builder.build());
+}
+
+test "IndexBuilder: write and read round-trip" {
+    const allocator = std.testing.allocator;
+
+    var builder = IndexBuilder.init(allocator);
+    defer builder.deinit();
+
+    _ = try builder.addFile("data/seqs.fasta");
+    try builder.addKey("alpha", 0, 0, 10, 50);
+    try builder.addKey("beta", 0, 100, 110, 75);
+
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(allocator);
+    try builder.write(buf.writer(allocator).any());
+
+    // Read back and verify.
+    var stream = std.io.fixedBufferStream(buf.items);
+    var idx = try ZeaselIndex.read(allocator, stream.reader().any());
+    defer idx.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), idx.entries.len);
+    try std.testing.expectEqual(@as(usize, 1), idx.file_names.len);
+    try std.testing.expectEqualStrings("data/seqs.fasta", idx.file_names[0]);
+
+    const e = idx.lookup("alpha") orelse return error.TestEntryNotFound;
+    try std.testing.expectEqual(@as(u64, 50), e.seq_len);
+
+    const e2 = idx.lookup("beta") orelse return error.TestEntryNotFound;
+    try std.testing.expectEqual(@as(u64, 75), e2.seq_len);
+}
+
+test "IndexBuilder: aliases" {
+    const allocator = std.testing.allocator;
+
+    var builder = IndexBuilder.init(allocator);
+    defer builder.deinit();
+
+    _ = try builder.addFile("test.fasta");
+    try builder.addKey("seq1", 0, 0, 5, 100);
+    try builder.addAlias("accession1", "seq1");
+
+    var idx = try builder.build();
+    defer idx.deinit();
+
+    // Lookup by alias returns the primary entry.
+    const e = idx.lookup("accession1") orelse return error.TestEntryNotFound;
+    try std.testing.expectEqualStrings("seq1", e.name);
+    try std.testing.expectEqual(@as(u64, 100), e.seq_len);
+}
+
+test "IndexBuilder: alias write round-trip" {
+    const allocator = std.testing.allocator;
+
+    var builder = IndexBuilder.init(allocator);
+    defer builder.deinit();
+
+    _ = try builder.addFile("test.fasta");
+    try builder.addKey("seq1", 0, 0, 5, 100);
+    try builder.addAlias("acc1", "seq1");
+
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(allocator);
+    try builder.write(buf.writer(allocator).any());
+
+    var stream = std.io.fixedBufferStream(buf.items);
+    var idx = try ZeaselIndex.read(allocator, stream.reader().any());
+    defer idx.deinit();
+
+    // Alias should survive serialization.
+    const e = idx.lookup("acc1") orelse return error.TestEntryNotFound;
+    try std.testing.expectEqualStrings("seq1", e.name);
+}
+
+test "IndexBuilder: multiple files" {
+    const allocator = std.testing.allocator;
+
+    var builder = IndexBuilder.init(allocator);
+    defer builder.deinit();
+
+    const id0 = try builder.addFile("file1.fasta");
+    const id1 = try builder.addFile("file2.fasta");
+
+    try std.testing.expectEqual(@as(u16, 0), id0);
+    try std.testing.expectEqual(@as(u16, 1), id1);
+
+    try builder.addKey("seq_a", 0, 0, 5, 100);
+    try builder.addKey("seq_b", 1, 0, 10, 200);
+
+    var idx = try builder.build();
+    defer idx.deinit();
+
+    const ea = idx.lookup("seq_a") orelse return error.TestEntryNotFound;
+    try std.testing.expectEqual(@as(u16, 0), ea.file_id);
+
+    const eb = idx.lookup("seq_b") orelse return error.TestEntryNotFound;
+    try std.testing.expectEqual(@as(u16, 1), eb.file_id);
+
+    try std.testing.expectEqualStrings("file1.fasta", idx.fileInfo(0).?);
+    try std.testing.expectEqualStrings("file2.fasta", idx.fileInfo(1).?);
+}
+
+test "IndexBuilder: alias to nonexistent primary fails on build" {
+    const allocator = std.testing.allocator;
+
+    var builder = IndexBuilder.init(allocator);
+    defer builder.deinit();
+
+    try builder.addKey("seq1", 0, 0, 5, 100);
+    try builder.addAlias("alias1", "nonexistent");
+
+    try std.testing.expectError(error.KeyNotFound, builder.build());
+}
+
+test "IndexBuilder: entries sorted by name after build" {
+    const allocator = std.testing.allocator;
+
+    var builder = IndexBuilder.init(allocator);
+    defer builder.deinit();
+
+    // Add in reverse order.
+    try builder.addKey("zebra", 0, 0, 5, 10);
+    try builder.addKey("alpha", 0, 100, 105, 20);
+    try builder.addKey("middle", 0, 200, 205, 30);
+
+    var idx = try builder.build();
+    defer idx.deinit();
+
+    // Entries should be sorted by name.
+    try std.testing.expectEqualStrings("alpha", idx.entries[0].name);
+    try std.testing.expectEqualStrings("middle", idx.entries[1].name);
+    try std.testing.expectEqualStrings("zebra", idx.entries[2].name);
 }

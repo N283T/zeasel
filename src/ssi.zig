@@ -11,6 +11,7 @@ const zeasel_ssi = @import("ssi/zeasel.zig");
 const easel_ssi = @import("ssi/easel.zig");
 
 pub const ZeaselIndex = zeasel_ssi.ZeaselIndex;
+pub const IndexBuilder = zeasel_ssi.IndexBuilder;
 pub const EaselIndex = easel_ssi.EaselIndex;
 pub const FileInfo = easel_ssi.FileInfo;
 
