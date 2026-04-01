@@ -104,20 +104,32 @@ pub fn removeGappyColumns(allocator: Allocator, m: Msa, max_gap_fraction: f64) !
     return m.selectColumns(mask);
 }
 
-/// Mark sequences as fragments if they have fewer than threshold fraction of
-/// non-gap residues relative to the alignment length.
+/// Mark sequences as fragments if their aligned span (first residue to last
+/// residue) is less than threshold fraction of the alignment length.
+/// Uses span, not residue count, matching Easel's esl_msa_MarkFragments.
 /// Returns a boolean slice: true = fragment. Caller owns it.
 pub fn markFragments(allocator: Allocator, m: Msa, threshold: f64) ![]bool {
     const n = m.nseq();
     const flags = try allocator.alloc(bool, n);
 
     for (0..n) |i| {
-        var non_gap: usize = 0;
-        for (m.seqs[i]) |code| {
-            if (!m.abc.isGap(code)) non_gap += 1;
+        // Find first and last residue positions (span).
+        var first: ?usize = null;
+        var last: usize = 0;
+        for (m.seqs[i], 0..) |code, col| {
+            if (m.abc.isResidue(code)) {
+                if (first == null) first = col;
+                last = col;
+            }
         }
-        const frac: f64 = @as(f64, @floatFromInt(non_gap)) / @as(f64, @floatFromInt(m.alen));
-        flags[i] = frac < threshold;
+        if (first) |f| {
+            const span = last - f + 1;
+            const frac: f64 = @as(f64, @floatFromInt(span)) / @as(f64, @floatFromInt(m.alen));
+            flags[i] = frac < threshold;
+        } else {
+            // No residues at all — definitely a fragment.
+            flags[i] = true;
+        }
     }
 
     return flags;

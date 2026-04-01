@@ -616,7 +616,13 @@ fn genericLinkage(allocator: Allocator, dist: []const f64, n: usize, leaf_names:
         parent_arr[mi] = @intCast(new_node);
         parent_arr[mj] = @intCast(new_node);
 
-        const node_height = min_d / 2.0;
+        // For linkage trees (single/complete), height = minD (raw linkage value).
+        // For additive trees (WPGMA/UPGMA), height = minD / 2.
+        // Reference: Easel esl_tree.c:1648-1649.
+        const node_height = switch (linkage) {
+            .single, .complete => min_d,
+            .wpgma => min_d / 2.0,
+        };
         height[new_node] = node_height;
         bl[mi] = node_height - height[mi];
         bl[mj] = node_height - height[mj];
@@ -901,9 +907,10 @@ test "singleLinkage: 3 sequences" {
 
     try std.testing.expectEqual(@as(usize, 5), tree.n_nodes);
     try std.testing.expectEqual(@as(usize, 3), tree.n_leaves);
-    // A-B merged first at min distance 0.4
-    try std.testing.expectApproxEqAbs(@as(f64, 0.2), tree.branch_length[0], 1e-10);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.2), tree.branch_length[1], 1e-10);
+    // A-B merged first at min distance 0.4.
+    // For linkage trees, height = minD (not minD/2), so branch_length = 0.4 - 0 = 0.4.
+    try std.testing.expectApproxEqAbs(@as(f64, 0.4), tree.branch_length[0], 1e-10);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.4), tree.branch_length[1], 1e-10);
 }
 
 test "completeLinkage: 3 sequences" {
