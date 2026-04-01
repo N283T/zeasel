@@ -12,9 +12,13 @@ pub fn pdf(x: f64, mu: f64, lambda: f64) f64 {
 }
 
 /// CDF: 1 - exp(-lambda * (x - mu)) for x >= mu, else 0.
+/// Uses Taylor approximation (1 - exp(-y) ≈ y) for small y to avoid
+/// catastrophic cancellation near mu.
 pub fn cdf(x: f64, mu: f64, lambda: f64) f64 {
     if (x < mu) return 0.0;
-    return 1.0 - @exp(-lambda * (x - mu));
+    const y = lambda * (x - mu);
+    if (y < 5e-9) return y; // Taylor: 1-exp(-y) ≈ y for small y
+    return 1.0 - @exp(-y);
 }
 
 /// Survival function: exp(-lambda * (x - mu)) for x >= mu, else 1.
@@ -135,6 +139,16 @@ test "exponential pdf below mu is zero" {
 
 test "exponential cdf below mu is zero" {
     try std.testing.expectEqual(@as(f64, 0.0), cdf(-1.0, 0.0, 1.0));
+}
+
+test "exponential cdf small-value guard near mu" {
+    // For very small y = lambda*(x-mu), cdf should use Taylor approx: 1-exp(-y) ≈ y
+    const tiny = 1e-12;
+    const result = cdf(tiny, 0.0, 1.0);
+    // Should be approximately equal to y = tiny
+    try std.testing.expectApproxEqAbs(tiny, result, 1e-20);
+    // At mu exactly, should be 0
+    try std.testing.expectEqual(@as(f64, 0.0), cdf(0.0, 0.0, 1.0));
 }
 
 test "exponential surv below mu is one" {

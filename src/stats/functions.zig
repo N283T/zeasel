@@ -220,13 +220,30 @@ pub fn linearRegression(x: []const f64, y: []const f64, sigma: ?[]const f64) !Li
     }
     const cc = if (sxx > 0 and syy > 0) sxy / @sqrt(sxx * syy) else 0;
 
-    // Chi-squared goodness-of-fit P-value (only meaningful with per-point sigma)
-    const q_val: ?f64 = if (sigma) |s| blk: {
-        var chi2: f64 = 0;
-        for (0..n) |i| {
-            const residual = y[i] - a_val - b_val * x[i];
+    // Chi-squared goodness-of-fit
+    var chi2: f64 = 0;
+    for (0..n) |i| {
+        const residual = y[i] - a_val - b_val * x[i];
+        if (sigma) |s| {
             chi2 += (residual * residual) / (s[i] * s[i]);
+        } else {
+            chi2 += residual * residual;
         }
+    }
+
+    // When sigma is null (uniform weights), adjust standard errors by the
+    // estimated per-point sigma from residuals: sqrt(chi2 / (n-2)).
+    // This matches Easel's esl_stats_LinearRegression behavior.
+    var sigma_a = sa;
+    var sigma_b = sb;
+    if (sigma == null) {
+        const s = @sqrt(chi2 / @as(f64, @floatFromInt(n - 2)));
+        sigma_a *= s;
+        sigma_b *= s;
+    }
+
+    // P-value only meaningful with per-point sigma
+    const q_val: ?f64 = if (sigma != null) blk: {
         const df: f64 = @floatFromInt(n - 2);
         break :blk 1.0 - gamma_mod.incompleteGamma(df / 2.0, chi2 / 2.0);
     } else null;
@@ -234,8 +251,8 @@ pub fn linearRegression(x: []const f64, y: []const f64, sigma: ?[]const f64) !Li
     return LinearRegressionResult{
         .a = a_val,
         .b = b_val,
-        .sigma_a = sa,
-        .sigma_b = sb,
+        .sigma_a = sigma_a,
+        .sigma_b = sigma_b,
         .cov_ab = cov,
         .cc = cc,
         .q = q_val,
@@ -333,6 +350,34 @@ test "linearRegression: chi-squared Q-value with sigma" {
     // For data close to a perfect line with reasonable sigma, q should be large (good fit)
     try std.testing.expect(result.q.? > 0.01);
     try std.testing.expect(result.q.? <= 1.0);
+}
+
+test "linearRegression: sigma adjustment for noisy data without per-point sigma" {
+    // With noise but no per-point sigma, sigma_a and sigma_b should be
+    // adjusted by sqrt(chi2/(n-2)) to reflect estimated residual scatter.
+    const x = [_]f64{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    const y = [_]f64{ 3.2, 4.8, 7.3, 8.7, 11.2, 12.9, 15.1, 16.8, 19.3, 20.7 };
+
+    const result = try linearRegression(&x, &y, null);
+    // Slope should be close to 2, intercept close to 1
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), result.b, 0.1);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), result.a, 0.5);
+    // sigma_a and sigma_b should be non-zero (adjusted by residual scatter)
+    try std.testing.expect(result.sigma_a > 0);
+    try std.testing.expect(result.sigma_b > 0);
+    // For a perfect line, sigma_a/sigma_b would be 0 after adjustment.
+    // For noisy data they should be meaningfully > 0.
+    try std.testing.expect(result.sigma_b > 0.01);
+}
+
+test "linearRegression: perfect line has zero sigma after adjustment" {
+    const x = [_]f64{ 1, 2, 3, 4, 5 };
+    const y = [_]f64{ 3, 5, 7, 9, 11 };
+
+    const result = try linearRegression(&x, &y, null);
+    // Perfect fit: chi2 = 0, so adjusted sigma_a and sigma_b should be 0
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), result.sigma_a, 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), result.sigma_b, 1e-12);
 }
 
 test "linearRegression: too few points" {

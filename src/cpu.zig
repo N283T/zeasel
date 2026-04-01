@@ -135,14 +135,20 @@ pub fn runtimeHasAVX() bool {
 }
 
 /// Detect AVX2 support at runtime.
+/// Also checks FMA3, BMI1, and BMI2 which are required by AVX2 code paths
+/// (matching Easel's esl_cpu_has_avx2 checks).
 pub fn runtimeHasAVX2() bool {
     if (comptime builtin.cpu.arch != .x86_64 and builtin.cpu.arch != .x86)
         return false;
     if (!runtimeHasAVX()) return false;
+    // FMA3 = leaf 1, ECX bit 12
+    const r1 = cpuid(1, 0);
+    const fma_mask: u32 = (1 << 12);
+    if ((r1.ecx & fma_mask) != fma_mask) return false;
     const r7 = cpuid(7, 0);
-    // AVX2 = EBX bit 5
-    const avx2_mask: u32 = (1 << 5);
-    return (r7.ebx & avx2_mask) == avx2_mask;
+    // AVX2 = EBX bit 5, BMI1 = EBX bit 3, BMI2 = EBX bit 8
+    const avx2_bmi_mask: u32 = (1 << 5) | (1 << 3) | (1 << 8);
+    return (r7.ebx & avx2_bmi_mask) == avx2_bmi_mask;
 }
 
 /// Detect AVX-512 Foundation support at runtime.
