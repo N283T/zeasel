@@ -9,6 +9,8 @@ pub const histogram = @import("stats/histogram.zig");
 pub const normal = @import("stats/normal.zig");
 pub const weibull = @import("stats/weibull.zig");
 pub const functions = @import("stats/functions.zig");
+pub const gev = @import("stats/gev.zig");
+pub const lognormal = @import("stats/lognormal.zig");
 
 test {
     _ = gumbel;
@@ -21,4 +23,6 @@ test {
     _ = normal;
     _ = weibull;
     _ = functions;
+    _ = gev;
+    _ = lognormal;
 }
