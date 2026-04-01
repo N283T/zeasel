@@ -70,6 +70,34 @@ pub const Format = enum {
         return null;
     }
 
+    /// Detect format from a filename extension.
+    /// Returns null if the extension is not recognized.
+    pub fn detectFromFilename(filename: []const u8) ?Format {
+        // Find the last '.' in the filename (after the last path separator).
+        var last_sep: usize = 0;
+        for (filename, 0..) |c, i| {
+            if (c == '/' or c == '\\') last_sep = i + 1;
+        }
+        const basename = filename[last_sep..];
+        // Find last dot in basename
+        var dot_pos: ?usize = null;
+        for (basename, 0..) |c, i| {
+            if (c == '.') dot_pos = i;
+        }
+        const ext = if (dot_pos) |d| basename[d..] else return null;
+
+        if (std.ascii.eqlIgnoreCase(ext, ".sto") or std.ascii.eqlIgnoreCase(ext, ".stk")) return .stockholm;
+        if (std.ascii.eqlIgnoreCase(ext, ".afa")) return .afa;
+        if (std.ascii.eqlIgnoreCase(ext, ".a2m")) return .a2m;
+        if (std.ascii.eqlIgnoreCase(ext, ".phy")) return .phylip;
+        if (std.ascii.eqlIgnoreCase(ext, ".slx") or std.ascii.eqlIgnoreCase(ext, ".selex")) return .selex;
+        if (std.ascii.eqlIgnoreCase(ext, ".pb")) return .psiblast;
+        if (std.ascii.eqlIgnoreCase(ext, ".fa") or std.ascii.eqlIgnoreCase(ext, ".fasta") or std.ascii.eqlIgnoreCase(ext, ".fna") or std.ascii.eqlIgnoreCase(ext, ".faa")) return .fasta;
+        if (std.ascii.eqlIgnoreCase(ext, ".gb") or std.ascii.eqlIgnoreCase(ext, ".gbk") or std.ascii.eqlIgnoreCase(ext, ".genbank")) return .genbank;
+        if (std.ascii.eqlIgnoreCase(ext, ".embl")) return .embl;
+        return null;
+    }
+
     fn detectPhylip(data: []const u8) bool {
         // PHYLIP starts with two whitespace-separated integers on the first line
         var it = std.mem.tokenizeAny(u8, data, " \t");
@@ -128,7 +156,9 @@ pub const Reader = struct {
         }
         errdefer if (data.ptr != raw_data.ptr) allocator.free(data);
 
-        const fmt = format orelse Format.detect(data) orelse return error.UnknownFormat;
+        const fmt = format orelse Format.detect(data) orelse
+            (if (!std.mem.eql(u8, path, "-")) Format.detectFromFilename(path) else null) orelse
+            return error.UnknownFormat;
 
         return Reader{
             .format = fmt,
@@ -705,6 +735,54 @@ test "Reader.next: embl auto-detect and iterate" {
 
 test "Format.detect: clustal" {
     try std.testing.expectEqual(@as(?Format, .clustal), Format.detect("CLUSTAL W (1.83) multiple sequence alignment\n"));
+}
+
+test "Format.detectFromFilename: stockholm extensions" {
+    try std.testing.expectEqual(@as(?Format, .stockholm), Format.detectFromFilename("alignment.sto"));
+    try std.testing.expectEqual(@as(?Format, .stockholm), Format.detectFromFilename("alignment.stk"));
+    try std.testing.expectEqual(@as(?Format, .stockholm), Format.detectFromFilename("/path/to/alignment.STO"));
+}
+
+test "Format.detectFromFilename: afa extension" {
+    try std.testing.expectEqual(@as(?Format, .afa), Format.detectFromFilename("seqs.afa"));
+}
+
+test "Format.detectFromFilename: a2m extension" {
+    try std.testing.expectEqual(@as(?Format, .a2m), Format.detectFromFilename("seqs.a2m"));
+}
+
+test "Format.detectFromFilename: phylip extension" {
+    try std.testing.expectEqual(@as(?Format, .phylip), Format.detectFromFilename("tree.phy"));
+}
+
+test "Format.detectFromFilename: selex extensions" {
+    try std.testing.expectEqual(@as(?Format, .selex), Format.detectFromFilename("aln.slx"));
+    try std.testing.expectEqual(@as(?Format, .selex), Format.detectFromFilename("aln.selex"));
+}
+
+test "Format.detectFromFilename: psiblast extension" {
+    try std.testing.expectEqual(@as(?Format, .psiblast), Format.detectFromFilename("result.pb"));
+}
+
+test "Format.detectFromFilename: fasta extensions" {
+    try std.testing.expectEqual(@as(?Format, .fasta), Format.detectFromFilename("seqs.fa"));
+    try std.testing.expectEqual(@as(?Format, .fasta), Format.detectFromFilename("seqs.fasta"));
+    try std.testing.expectEqual(@as(?Format, .fasta), Format.detectFromFilename("seqs.fna"));
+    try std.testing.expectEqual(@as(?Format, .fasta), Format.detectFromFilename("seqs.faa"));
+}
+
+test "Format.detectFromFilename: genbank extensions" {
+    try std.testing.expectEqual(@as(?Format, .genbank), Format.detectFromFilename("seq.gb"));
+    try std.testing.expectEqual(@as(?Format, .genbank), Format.detectFromFilename("seq.gbk"));
+}
+
+test "Format.detectFromFilename: embl extension" {
+    try std.testing.expectEqual(@as(?Format, .embl), Format.detectFromFilename("seq.embl"));
+}
+
+test "Format.detectFromFilename: unknown extension returns null" {
+    try std.testing.expectEqual(@as(?Format, null), Format.detectFromFilename("data.txt"));
+    try std.testing.expectEqual(@as(?Format, null), Format.detectFromFilename("noext"));
 }
 
 test "Reader.next: clustal auto-detect yields ungapped sequences" {

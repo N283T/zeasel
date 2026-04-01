@@ -111,8 +111,10 @@ pub fn parseOneGenBank(allocator: Allocator, abc: *const Alphabet, data: []const
                 const rest = std.mem.trimLeft(u8, line["DEFINITION".len..], " \t");
                 try desc_buf.appendSlice(allocator, rest);
                 in_definition = true;
-            } else if (std.mem.startsWith(u8, line, "ACCESSION")) {
-                const rest = std.mem.trimLeft(u8, line["ACCESSION".len..], " \t");
+            } else if (std.mem.startsWith(u8, line, "VERSION")) {
+                // VERSION line format: "VERSION   <accession.version>"
+                // Like Easel, use VERSION for accession (includes version suffix).
+                const rest = std.mem.trimLeft(u8, line["VERSION".len..], " \t");
                 // Take first whitespace-delimited token
                 var end: usize = 0;
                 while (end < rest.len and !std.ascii.isWhitespace(rest[end])) {
@@ -332,11 +334,21 @@ pub fn writeGenBank(dest: std.io.AnyWriter, seq: Sequence) !void {
         try dest.writeAll("DEFINITION  .\n");
     }
 
-    // ACCESSION line
+    // ACCESSION line (base accession without version suffix)
     if (seq.accession) |acc| {
-        try dest.print("ACCESSION   {s}\n", .{acc});
+        // Strip version suffix (everything after last '.') for ACCESSION line
+        const base_acc = if (std.mem.lastIndexOfScalar(u8, acc, '.')) |dot|
+            acc[0..dot]
+        else
+            acc;
+        try dest.print("ACCESSION   {s}\n", .{base_acc});
     } else {
         try dest.print("ACCESSION   {s}\n", .{seq.name});
+    }
+
+    // VERSION line (full accession.version)
+    if (seq.accession) |acc| {
+        try dest.print("VERSION     {s}\n", .{acc});
     }
 
     // ORIGIN section
@@ -438,12 +450,13 @@ pub fn writeEmbl(dest: std.io.AnyWriter, seq: Sequence) !void {
 
 const alphabet_mod = @import("../alphabet.zig");
 
-test "parseAllGenBank: single record" {
+test "parseAllGenBank: single record with VERSION" {
     const allocator = std.testing.allocator;
     const data =
         \\LOCUS       SCU49845     5028 bp    DNA
         \\DEFINITION  Saccharomyces cerevisiae TCP1-beta gene, partial cds.
         \\ACCESSION   U49845
+        \\VERSION     U49845.1
         \\ORIGIN
         \\        1 acgt acgt
         \\//
@@ -457,12 +470,35 @@ test "parseAllGenBank: single record" {
 
     try std.testing.expectEqual(@as(usize, 1), seqs.len);
     try std.testing.expectEqualStrings("SCU49845", seqs[0].name);
-    try std.testing.expectEqualStrings("U49845", seqs[0].accession.?);
+    // Accession comes from VERSION line, not ACCESSION
+    try std.testing.expectEqualStrings("U49845.1", seqs[0].accession.?);
     try std.testing.expectEqualStrings(
         "Saccharomyces cerevisiae TCP1-beta gene, partial cds.",
         seqs[0].description.?,
     );
     try std.testing.expectEqual(@as(usize, 8), seqs[0].dsq.len);
+}
+
+test "parseAllGenBank: no VERSION line gives null accession" {
+    const allocator = std.testing.allocator;
+    const data =
+        \\LOCUS       SEQ1
+        \\ACCESSION   X12345
+        \\ORIGIN
+        \\        1 acgt
+        \\//
+        \\
+    ;
+    const seqs = try parseAllGenBank(allocator, &alphabet_mod.dna, data);
+    defer {
+        for (seqs) |*s| @constCast(s).deinit();
+        allocator.free(seqs);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), seqs.len);
+    try std.testing.expectEqualStrings("SEQ1", seqs[0].name);
+    // No VERSION line means no accession
+    try std.testing.expectEqual(@as(?[]const u8, null), seqs[0].accession);
 }
 
 test "parseAllGenBank: sequence strips numbers and spaces" {
@@ -641,6 +677,7 @@ test "writeGenBank: basic structure" {
     try std.testing.expect(std.mem.indexOf(u8, out, "LOCUS       SEQ1") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "DEFINITION  A test sequence") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "ACCESSION   ACC001") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "VERSION     ACC001") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "ORIGIN") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "acgt") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "//") != null);
@@ -671,12 +708,17 @@ test "GenBank round-trip: write then parse" {
     const allocator = std.testing.allocator;
     var seq = try Sequence.fromText(allocator, &alphabet_mod.dna, "SEQ1", "ACGTACGT");
     defer seq.deinit();
-    seq.accession = try allocator.dupe(u8, "U12345");
+    seq.accession = try allocator.dupe(u8, "U12345.1");
     seq.description = try allocator.dupe(u8, "Round trip test");
 
     var buf = std.ArrayList(u8){};
     defer buf.deinit(allocator);
     try writeGenBank(buf.writer(allocator).any(), seq);
+
+    // Verify VERSION line is written
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "VERSION     U12345.1") != null);
+    // Verify ACCESSION line strips version suffix
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "ACCESSION   U12345\n") != null);
 
     const parsed = try parseAllGenBank(allocator, &alphabet_mod.dna, buf.items);
     defer {
@@ -686,7 +728,8 @@ test "GenBank round-trip: write then parse" {
 
     try std.testing.expectEqual(@as(usize, 1), parsed.len);
     try std.testing.expectEqualStrings("SEQ1", parsed[0].name);
-    try std.testing.expectEqualStrings("U12345", parsed[0].accession.?);
+    // Round-trip: accession comes from VERSION line
+    try std.testing.expectEqualStrings("U12345.1", parsed[0].accession.?);
     try std.testing.expectEqualStrings("Round trip test", parsed[0].description.?);
     try std.testing.expectEqualSlices(u8, seq.dsq, parsed[0].dsq);
 }
