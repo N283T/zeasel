@@ -175,6 +175,26 @@ pub const DsqData = union(enum) {
         }
     }
 
+    /// Seek to and read a specific sequence by index (0-based).
+    /// Only supported for Easel format (which has a .dsqi index file).
+    /// Returns null if seq_idx is out of range.
+    pub fn readSequence(self: *DsqData, allocator: Allocator, abc: *const Alphabet, seq_idx: u64) !?Sequence {
+        switch (self.*) {
+            .zeasel => return error.RandomAccessNotSupported,
+            .easel => |*e| return e.readSequence(allocator, abc, seq_idx),
+        }
+    }
+
+    /// Read a chunk of sequences starting at seq_idx.
+    /// Only supported for Easel format (which has a .dsqi index file).
+    /// Returns up to max_seqs sequences. Caller owns the returned slice and each Sequence.
+    pub fn readChunk(self: *DsqData, allocator: Allocator, abc: *const Alphabet, seq_idx: u64, max_seqs: usize) ![]Sequence {
+        switch (self.*) {
+            .zeasel => return error.RandomAccessNotSupported,
+            .easel => |*e| return e.readChunk(allocator, abc, seq_idx, max_seqs),
+        }
+    }
+
     /// Close all file handles and release resources.
     pub fn deinit(self: *DsqData) void {
         switch (self.*) {
@@ -324,4 +344,149 @@ test "DsqData.open: auto-detects easel format from .dsqi path" {
     defer seq.deinit();
     try std.testing.expectEqualStrings("dsqi_seq", seq.name);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 2, 3, 4 }, seq.dsq);
+}
+
+test "DsqData.readSequence: dispatches to easel format" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    // Create 2-sequence amino database
+    const pkt0: u32 = pack.EOD | pack.FIVEBIT |
+        (@as(u32, 0) << 25) |
+        (@as(u32, 1) << 20) |
+        (@as(u32, 31) << 15) |
+        (@as(u32, 31) << 10) |
+        (@as(u32, 31) << 5) |
+        (@as(u32, 31) << 0);
+
+    const pkt1: u32 = pack.EOD | pack.FIVEBIT |
+        (@as(u32, 2) << 25) |
+        (@as(u32, 3) << 20) |
+        (@as(u32, 4) << 15) |
+        (@as(u32, 31) << 10) |
+        (@as(u32, 31) << 5) |
+        (@as(u32, 31) << 0);
+
+    const packets0 = [_]u32{pkt0};
+    const packets1 = [_]u32{pkt1};
+    const names = [_][]const u8{ "first", "second" };
+    const pkt_seqs = [_][]const u32{ &packets0, &packets1 };
+    const lens = [_]u64{ 2, 3 };
+
+    try easel_dsqdata.writeTestEaselDb(tmp_dir.dir, "hubrand", 0x12345678, 3, &names, &pkt_seqs, &lens);
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try tmp_dir.dir.realpath(".", &path_buf);
+    const full_path = try std.fmt.allocPrint(allocator, "{s}/hubrand", .{dir_path});
+    defer allocator.free(full_path);
+
+    var db = try DsqData.open(allocator, full_path);
+    defer db.deinit();
+
+    try std.testing.expect(db == .easel);
+
+    // Random access: read sequence 1 first
+    {
+        var seq = (try db.readSequence(allocator, &alphabet_mod.amino, 1)).?;
+        defer seq.deinit();
+        try std.testing.expectEqualStrings("second", seq.name);
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 2, 3, 4 }, seq.dsq);
+    }
+
+    // Random access: read sequence 0
+    {
+        var seq = (try db.readSequence(allocator, &alphabet_mod.amino, 0)).?;
+        defer seq.deinit();
+        try std.testing.expectEqualStrings("first", seq.name);
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1 }, seq.dsq);
+    }
+
+    // Out of range
+    const out = try db.readSequence(allocator, &alphabet_mod.amino, 99);
+    try std.testing.expect(out == null);
+}
+
+test "DsqData.readSequence: returns error for zeasel format" {
+    const allocator = std.testing.allocator;
+
+    // Create a zeasel ZSQD file.
+    var seq1 = try Sequence.fromText(allocator, &alphabet_mod.dna, "test", "ACGT");
+    defer seq1.deinit();
+
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(allocator);
+
+    const originals = [_]Sequence{seq1};
+    try write(buf.writer(allocator).any(), &alphabet_mod.dna, &originals);
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zsqd", .data = buf.items });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try tmp_dir.dir.realpath(".", &path_buf);
+    const full_path = try std.fmt.allocPrint(allocator, "{s}/test.zsqd", .{dir_path});
+    defer allocator.free(full_path);
+
+    var db = try DsqData.open(allocator, full_path);
+    defer db.deinit();
+
+    try std.testing.expect(db == .zeasel);
+
+    // readSequence should return error for zeasel format
+    try std.testing.expectError(error.RandomAccessNotSupported, db.readSequence(allocator, &alphabet_mod.dna, 0));
+}
+
+test "DsqData.readChunk: dispatches to easel format" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const make_pkt = struct {
+        fn f(code: u32) u32 {
+            return pack.EOD | pack.FIVEBIT |
+                (code << 25) |
+                (@as(u32, 31) << 20) |
+                (@as(u32, 31) << 15) |
+                (@as(u32, 31) << 10) |
+                (@as(u32, 31) << 5) |
+                (@as(u32, 31) << 0);
+        }
+    }.f;
+
+    const pkts = [3][1]u32{
+        .{make_pkt(0)},
+        .{make_pkt(1)},
+        .{make_pkt(2)},
+    };
+
+    const names = [_][]const u8{ "a", "b", "c" };
+    const pkt_seqs = [_][]const u32{ &pkts[0], &pkts[1], &pkts[2] };
+    const lens = [_]u64{ 1, 1, 1 };
+
+    try easel_dsqdata.writeTestEaselDb(tmp_dir.dir, "hubchunk", 0xABCD1234, 3, &names, &pkt_seqs, &lens);
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try tmp_dir.dir.realpath(".", &path_buf);
+    const full_path = try std.fmt.allocPrint(allocator, "{s}/hubchunk", .{dir_path});
+    defer allocator.free(full_path);
+
+    var db = try DsqData.open(allocator, full_path);
+    defer db.deinit();
+
+    const chunk = try db.readChunk(allocator, &alphabet_mod.amino, 1, 2);
+    defer {
+        for (chunk) |*s| {
+            var seq = s.*;
+            seq.deinit();
+        }
+        allocator.free(chunk);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), chunk.len);
+    try std.testing.expectEqualStrings("b", chunk[0].name);
+    try std.testing.expectEqualStrings("c", chunk[1].name);
 }
