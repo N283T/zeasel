@@ -14,8 +14,8 @@ pub fn percentIdentity(abc: *const Alphabet, seq1: []const u8, seq2: []const u8)
     var len1: u32 = 0;
     var len2: u32 = 0;
     for (seq1, seq2) |a, b| {
-        const a_res = !abc.isGap(a);
-        const b_res = !abc.isGap(b);
+        const a_res = abc.isResidue(a);
+        const b_res = abc.isResidue(b);
         if (a_res) len1 += 1;
         if (b_res) len2 += 1;
         if (a_res and b_res and a == b) matches += 1;

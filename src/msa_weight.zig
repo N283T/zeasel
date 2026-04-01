@@ -143,7 +143,7 @@ pub fn idFilter(allocator: Allocator, m: Msa, max_id: f64) ![]bool {
         if (!keep[i]) continue;
         for (i + 1..n) |j| {
             if (!keep[j]) continue;
-            if (pairwiseIdentity(m, i, j) > max_id) {
+            if (pairwiseIdentity(m, i, j) >= max_id) {
                 keep[j] = false;
             }
         }
@@ -305,8 +305,8 @@ pub fn pairwiseIdentity(m: Msa, i: usize, j: usize) f64 {
     for (0..m.alen) |col| {
         const a = m.seqs[i][col];
         const b = m.seqs[j][col];
-        const a_res = !m.abc.isGap(a);
-        const b_res = !m.abc.isGap(b);
+        const a_res = m.abc.isResidue(a);
+        const b_res = m.abc.isResidue(b);
         if (a_res) len1 += 1;
         if (b_res) len2 += 1;
         if (a_res and b_res and a == b) matches += 1;

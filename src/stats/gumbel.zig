@@ -61,7 +61,16 @@ pub fn invcdf(p: f64, mu: f64, lambda: f64) f64 {
 }
 
 /// Inverse survival: mu - (1/lambda) * log(-log(1-p))
+/// For very small p (< 5e-9), uses a numerically stable approximation
+/// to avoid catastrophic cancellation in 1.0 - p.
+/// Reference: Easel esl_gumbel_invsurv().
 pub fn invsurv(p: f64, mu: f64, lambda: f64) f64 {
+    // For very small p, 1.0 - p loses precision (rounds to 1.0 when p < ~1e-16).
+    // Use the approximation: log(-log(1-p)) ≈ log(p) for small p.
+    // More precisely: log(1-p) ≈ -p for small p, so -log(1-p) ≈ p, so log(-log(1-p)) ≈ log(p).
+    if (p < 5e-9) {
+        return mu - (1.0 / lambda) * @log(p);
+    }
     return invcdf(1.0 - p, mu, lambda);
 }
 

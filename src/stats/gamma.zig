@@ -32,6 +32,20 @@ pub fn incompleteGamma(a: f64, x: f64) f64 {
     }
 }
 
+/// Regularized upper incomplete gamma Q(a, x) = 1 - P(a, x).
+/// Computed directly (without subtraction from 1.0) when possible,
+/// avoiding precision loss in the tail.
+pub fn upperIncompleteGamma(a: f64, x: f64) f64 {
+    if (x == 0) return 1.0;
+    if (x < a + 1.0) {
+        // Series gives P; compute Q = 1 - P (less precise in tail, but x < a+1 means we're not deep in tail)
+        return 1.0 - gammaSeries(a, x);
+    } else {
+        // Continued fraction gives Q directly — precise in the tail
+        return gammaContFrac(a, x);
+    }
+}
+
 /// Series expansion for the regularized lower incomplete gamma.
 /// Converges for x < a+1.
 fn gammaSeries(a: f64, x: f64) f64 {
@@ -101,9 +115,12 @@ pub fn cdf(x: f64, mu: f64, lambda: f64, a: f64) f64 {
     return incompleteGamma(a, lambda * (x - mu));
 }
 
-/// Survival = 1 - CDF
+/// Survival = Q(a, x) computed directly via upper incomplete gamma.
+/// Avoids precision loss from 1.0 - P when P is near 1.0 (deep tail).
+/// Reference: Easel esl_gam_surv.
 pub fn surv(x: f64, mu: f64, lambda: f64, a: f64) f64 {
-    return 1.0 - cdf(x, mu, lambda, a);
+    if (x <= mu) return 1.0;
+    return upperIncompleteGamma(a, lambda * (x - mu));
 }
 
 /// Result of fitting a gamma distribution.
@@ -183,13 +200,14 @@ pub fn logCdf(x: f64, mu: f64, lambda: f64, a: f64) f64 {
     return @log(val);
 }
 
-/// Log survival: log(1 - P(a, lambda*(x-mu))).
+/// Log survival: log(Q(a, x)) computed directly via upper incomplete gamma.
+/// Avoids precision loss from log(1 - P) when P is near 1.0.
+/// Reference: Easel esl_gam_logsurv.
 /// Returns 0 for x <= mu.
 pub fn logSurv(x: f64, mu: f64, lambda: f64, a: f64) f64 {
     if (x <= mu) return 0.0;
-    const p = incompleteGamma(a, lambda * (x - mu));
-    // When p is near 0, log(1-p) ~ -p via log1p.
-    return math.log1p(-p);
+    const q = upperIncompleteGamma(a, lambda * (x - mu));
+    return @log(q);
 }
 
 /// Inverse CDF (quantile function) of the Gamma distribution.

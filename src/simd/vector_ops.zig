@@ -198,12 +198,20 @@ pub fn VectorOps(comptime T: type) type {
         // Float-only operations
         // ----------------------------------------------------------------
 
-        /// Normalize v so elements sum to 1 (L1 norm). No-op if sum is zero.
+        /// Normalize v so elements sum to 1 (L1 norm).
+        /// When sum is zero, sets all elements to 1/n (uniform distribution),
+        /// matching Easel's esl_vec_DNorm behavior.
         /// Only available for float types.
         pub fn normalize(v: []T) void {
             comptime if (!is_float) @compileError("normalize requires a float type");
             const s = sum(v);
-            if (s == 0) return;
+            if (s == 0) {
+                if (v.len > 0) {
+                    const uniform: T = 1.0 / @as(T, @floatFromInt(v.len));
+                    for (v) |*x| x.* = uniform;
+                }
+                return;
+            }
             scale(v, 1 / s);
         }
 
@@ -219,34 +227,36 @@ pub fn VectorOps(comptime T: type) type {
         }
 
         /// Numerically stable log(sum(exp(v))): find max, then max + log(sum(exp(v[i]-max))).
+        /// Guards against +inf max and skips extreme underflow terms.
+        /// Reference: Easel esl_vec_DLogSum.
         /// Only available for float types.
         pub fn logSum(v: []const T) T {
             comptime if (!is_float) @compileError("logSum requires a float type");
             if (v.len == 0) return -math.inf(T);
             const m = max(v);
+            if (math.isPositiveInf(m)) return math.inf(T);
             var s: T = 0;
             for (v) |x| {
-                s += @exp(x - m);
+                // Skip terms that would cause extreme underflow (or NaN from -inf - -inf).
+                if (x >= m - 500) {
+                    s += @exp(x - m);
+                }
             }
             return m + @log(s);
         }
 
-        /// Normalize a log-probability vector: v[i] = v[i] - logSum(v).
-        /// After this, sum(exp(v[i])) = 1.
+        /// Convert a log-probability vector to a normalized probability vector.
+        /// Subtracts logSum, exponentiates, then re-normalizes.
+        /// Reference: Easel esl_vec_DLogNorm.
         /// Only available for float types.
         pub fn logNorm(v: []T) void {
             comptime if (!is_float) @compileError("logNorm requires a float type");
             if (v.len == 0) return;
             const denom = logSum(v);
-            const splat: V = @splat(denom);
-            var i: usize = 0;
-            while (i + vec_len <= v.len) : (i += vec_len) {
-                const chunk: V = v[i..][0..vec_len].*;
-                v[i..][0..vec_len].* = chunk - splat;
+            for (v) |*x| {
+                x.* = @exp(x.* - denom);
             }
-            while (i < v.len) : (i += 1) {
-                v[i] -= denom;
-            }
+            normalize(v);
         }
 
         /// Element-wise natural log: dest[i] = ln(src[i]).
@@ -270,8 +280,9 @@ pub fn VectorOps(comptime T: type) type {
             }
         }
 
-        /// Kullback-Leibler divergence D_KL(p||q) = sum(p[i] * ln(p[i]/q[i])).
+        /// Kullback-Leibler divergence D_KL(p||q) = sum(p[i] * log2(p[i]/q[i])) in bits.
         /// Terms where p[i] == 0 are skipped. Returns inf if any p[i] > 0 and q[i] == 0.
+        /// Reference: Easel esl_vec_DRelEntropy (returns bits, not nats).
         /// Only available for float types. Slices must have equal length.
         pub fn relativeEntropy(p: []const T, q: []const T) T {
             comptime if (!is_float) @compileError("relativeEntropy requires a float type");
@@ -280,7 +291,7 @@ pub fn VectorOps(comptime T: type) type {
             for (p, q) |pi, qi| {
                 if (pi > 0) {
                     if (qi == 0) return math.inf(T);
-                    kl += pi * @log(pi / qi);
+                    kl += pi * @log2(pi / qi);
                 }
             }
             return kl;
@@ -306,12 +317,13 @@ pub fn VectorOps(comptime T: type) type {
             return true;
         }
 
-        /// Return true if all elements are <= 0 and finite (valid log-probabilities).
+        /// Return true if all elements are valid log-probabilities (<= 0, not NaN, not +inf).
+        /// -inf is accepted (represents log(0) = probability 0).
         /// Only available for float types.
         pub fn logValidate(v: []const T) bool {
             comptime if (!is_float) @compileError("logValidate requires a float type");
             for (v) |x| {
-                if (math.isNan(x) or math.isInf(x) or x > 0) return false;
+                if (math.isNan(x) or math.isPositiveInf(x) or x > 0) return false;
             }
             return true;
         }
