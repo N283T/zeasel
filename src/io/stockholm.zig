@@ -345,6 +345,15 @@ pub fn parse(allocator: Allocator, abc: *const Alphabet, data: []const u8) !Msa 
         } else if (std.mem.eql(u8, key, "RF")) {
             if (msa.reference) |old| allocator.free(old);
             msa.reference = try allocator.dupe(u8, annot_buf.items);
+        } else if (std.mem.eql(u8, key, "SA_cons")) {
+            if (msa.sa_cons) |old| allocator.free(old);
+            msa.sa_cons = try allocator.dupe(u8, annot_buf.items);
+        } else if (std.mem.eql(u8, key, "PP_cons")) {
+            if (msa.pp_cons) |old| allocator.free(old);
+            msa.pp_cons = try allocator.dupe(u8, annot_buf.items);
+        } else if (std.mem.eql(u8, key, "MM")) {
+            if (msa.mm) |old| allocator.free(old);
+            msa.mm = try allocator.dupe(u8, annot_buf.items);
         }
     }
     if (gc_list.items.len > 0) {
@@ -395,6 +404,21 @@ pub fn parse(allocator: Allocator, abc: *const Alphabet, data: []const u8) !Msa 
         const owned_annot = try allocator.dupe(u8, annot_buf.items);
         errdefer allocator.free(owned_annot);
         try gr_list.append(allocator, .{ .seq_name = owned_sn, .tag = owned_tag, .annotation = owned_annot });
+
+        // Populate per-sequence convenience fields for SS/SA/PP.
+        if (std.mem.eql(u8, tag, "SS") or std.mem.eql(u8, tag, "SA") or std.mem.eql(u8, tag, "PP")) {
+            // Find the sequence index for this name.
+            const seq_idx = name_index.get(seq_nm);
+            if (seq_idx) |si| {
+                if (std.mem.eql(u8, tag, "SS")) {
+                    try msa.setSeqSS(si, annot_buf.items);
+                } else if (std.mem.eql(u8, tag, "SA")) {
+                    try msa.setSeqSA(si, annot_buf.items);
+                } else if (std.mem.eql(u8, tag, "PP")) {
+                    try msa.setSeqPP(si, annot_buf.items);
+                }
+            }
+        }
     }
     if (gr_list.items.len > 0) {
         msa.gr_markup = try gr_list.toOwnedSlice(allocator);
@@ -1340,4 +1364,63 @@ test "parse: duplicate sequence name in same block returns error" {
         \\//
     ;
     try testing.expectError(error.InvalidFormat, parse(allocator, abc, data));
+}
+
+test "parse: GR SS/SA/PP populate per-sequence fields" {
+    const allocator = testing.allocator;
+    const abc = &alphabet_mod.dna;
+
+    const data =
+        \\# STOCKHOLM 1.0
+        \\
+        \\seq1  ACGT
+        \\#=GR seq1 SS <..>
+        \\#=GR seq1 SA 1234
+        \\#=GR seq1 PP ****
+        \\seq2  TTTT
+        \\#=GR seq2 SS (..)
+        \\//
+    ;
+
+    var msa = try parse(allocator, abc, data);
+    defer msa.deinit();
+
+    try testing.expectEqual(@as(usize, 2), msa.nseq());
+
+    // Per-sequence SS
+    try testing.expect(msa.ss != null);
+    try testing.expectEqualStrings("<..>", msa.ss.?[0].?);
+    try testing.expectEqualStrings("(..)", msa.ss.?[1].?);
+
+    // Per-sequence SA (only seq1 has it)
+    try testing.expect(msa.sa != null);
+    try testing.expectEqualStrings("1234", msa.sa.?[0].?);
+    try testing.expectEqual(@as(?[]const u8, null), msa.sa.?[1]);
+
+    // Per-sequence PP (only seq1 has it)
+    try testing.expect(msa.pp != null);
+    try testing.expectEqualStrings("****", msa.pp.?[0].?);
+    try testing.expectEqual(@as(?[]const u8, null), msa.pp.?[1]);
+}
+
+test "parse: GC SA_cons, PP_cons, MM populate convenience fields" {
+    const allocator = testing.allocator;
+    const abc = &alphabet_mod.dna;
+
+    const data =
+        \\# STOCKHOLM 1.0
+        \\
+        \\seq1  ACGT
+        \\#=GC SA_cons 1234
+        \\#=GC PP_cons ****
+        \\#=GC MM      mmmm
+        \\//
+    ;
+
+    var msa = try parse(allocator, abc, data);
+    defer msa.deinit();
+
+    try testing.expectEqualStrings("1234", msa.sa_cons.?);
+    try testing.expectEqualStrings("****", msa.pp_cons.?);
+    try testing.expectEqualStrings("mmmm", msa.mm.?);
 }

@@ -5,6 +5,7 @@ const Allocator = std.mem.Allocator;
 const alphabet_mod = @import("alphabet.zig");
 const Alphabet = alphabet_mod.Alphabet;
 const Sequence = @import("sequence.zig").Sequence;
+const wuss = @import("wuss.zig");
 
 /// A single #=GF line: per-file annotation tag and value.
 pub const GfEntry = struct { tag: []const u8, value: []const u8 };
@@ -36,9 +37,17 @@ pub const Msa = struct {
     seq_accessions: ?[]?[]const u8 = null,
     seq_descriptions: ?[]?[]const u8 = null,
 
+    // Per-sequence annotations indexed by sequence index (allocator-owned if non-null)
+    ss: ?[]?[]const u8 = null, // per-sequence secondary structure (#=GR SS)
+    sa: ?[]?[]const u8 = null, // per-sequence surface accessibility (#=GR SA)
+    pp: ?[]?[]const u8 = null, // per-sequence posterior probability (#=GR PP)
+
     // Per-column consensus annotations (allocator-owned if non-null)
     consensus_ss: ?[]const u8 = null, // #=GC SS_cons
     reference: ?[]const u8 = null, // #=GC RF
+    sa_cons: ?[]const u8 = null, // #=GC SA_cons
+    pp_cons: ?[]const u8 = null, // #=GC PP_cons
+    mm: ?[]const u8 = null, // #=GC MM
 
     // Generic markup storage for round-trip fidelity (allocator-owned if non-null)
     gf_markup: ?[]GfEntry = null, // all #=GF lines
@@ -141,6 +150,39 @@ pub const Msa = struct {
         }
         if (self.seq_descriptions.?[idx]) |old| self.allocator.free(old);
         self.seq_descriptions.?[idx] = try self.allocator.dupe(u8, s);
+    }
+
+    /// Set per-sequence secondary structure annotation. Allocates the ss array on first use.
+    pub fn setSeqSS(self: *Msa, idx: usize, s: []const u8) !void {
+        if (idx >= self.names.len) return error.OutOfBounds;
+        if (self.ss == null) {
+            self.ss = try self.allocator.alloc(?[]const u8, self.names.len);
+            for (self.ss.?) |*slot| slot.* = null;
+        }
+        if (self.ss.?[idx]) |old| self.allocator.free(old);
+        self.ss.?[idx] = try self.allocator.dupe(u8, s);
+    }
+
+    /// Set per-sequence surface accessibility annotation. Allocates the sa array on first use.
+    pub fn setSeqSA(self: *Msa, idx: usize, s: []const u8) !void {
+        if (idx >= self.names.len) return error.OutOfBounds;
+        if (self.sa == null) {
+            self.sa = try self.allocator.alloc(?[]const u8, self.names.len);
+            for (self.sa.?) |*slot| slot.* = null;
+        }
+        if (self.sa.?[idx]) |old| self.allocator.free(old);
+        self.sa.?[idx] = try self.allocator.dupe(u8, s);
+    }
+
+    /// Set per-sequence posterior probability annotation. Allocates the pp array on first use.
+    pub fn setSeqPP(self: *Msa, idx: usize, s: []const u8) !void {
+        if (idx >= self.names.len) return error.OutOfBounds;
+        if (self.pp == null) {
+            self.pp = try self.allocator.alloc(?[]const u8, self.names.len);
+            for (self.pp.?) |*slot| slot.* = null;
+        }
+        if (self.pp.?[idx]) |old| self.allocator.free(old);
+        self.pp.?[idx] = try self.allocator.dupe(u8, s);
     }
 
     /// Set all sequence weights to 1.0 (uniform).
@@ -306,6 +348,24 @@ pub const Msa = struct {
         if (self.seq_descriptions) |descs| {
             if (descs.len != self.names.len) return false;
         }
+        if (self.ss) |arr| {
+            if (arr.len != self.names.len) return false;
+        }
+        if (self.sa) |arr| {
+            if (arr.len != self.names.len) return false;
+        }
+        if (self.pp) |arr| {
+            if (arr.len != self.names.len) return false;
+        }
+        if (self.sa_cons) |v| {
+            if (v.len != self.alen) return false;
+        }
+        if (self.pp_cons) |v| {
+            if (v.len != self.alen) return false;
+        }
+        if (self.mm) |v| {
+            if (v.len != self.alen) return false;
+        }
         return true;
     }
 
@@ -404,15 +464,18 @@ pub const Msa = struct {
             }
         }
 
-        // Filter per-column annotations
+        // Filter per-column annotations, fixing broken base pairs in SS first.
         var new_ss: ?[]const u8 = null;
         errdefer if (new_ss) |s| self.allocator.free(s);
         if (self.consensus_ss) |ss| {
+            // Fix broken base pairs at original length, then select columns.
+            const fixed = try fixBrokenBasepairs(self.allocator, ss, mask);
+            defer self.allocator.free(fixed);
             const buf = try self.allocator.alloc(u8, new_alen);
             var col: usize = 0;
             for (0..self.alen) |c| {
                 if (mask[c]) {
-                    buf[col] = ss[c];
+                    buf[col] = fixed[c];
                     col += 1;
                 }
             }
@@ -431,6 +494,143 @@ pub const Msa = struct {
                 }
             }
             new_rf = buf;
+        }
+
+        // Filter additional per-column consensus annotations
+        var new_sa_cons: ?[]const u8 = null;
+        errdefer if (new_sa_cons) |s| self.allocator.free(s);
+        if (self.sa_cons) |v| {
+            const buf = try self.allocator.alloc(u8, new_alen);
+            var col: usize = 0;
+            for (0..self.alen) |c| {
+                if (mask[c]) {
+                    buf[col] = v[c];
+                    col += 1;
+                }
+            }
+            new_sa_cons = buf;
+        }
+
+        var new_pp_cons: ?[]const u8 = null;
+        errdefer if (new_pp_cons) |s| self.allocator.free(s);
+        if (self.pp_cons) |v| {
+            const buf = try self.allocator.alloc(u8, new_alen);
+            var col: usize = 0;
+            for (0..self.alen) |c| {
+                if (mask[c]) {
+                    buf[col] = v[c];
+                    col += 1;
+                }
+            }
+            new_pp_cons = buf;
+        }
+
+        var new_mm: ?[]const u8 = null;
+        errdefer if (new_mm) |s| self.allocator.free(s);
+        if (self.mm) |v| {
+            const buf = try self.allocator.alloc(u8, new_alen);
+            var col: usize = 0;
+            for (0..self.alen) |c| {
+                if (mask[c]) {
+                    buf[col] = v[c];
+                    col += 1;
+                }
+            }
+            new_mm = buf;
+        }
+
+        // Filter per-sequence annotations (ss/sa/pp)
+        var new_per_ss: ?[]?[]const u8 = null;
+        var per_ss_done: usize = 0;
+        errdefer {
+            if (new_per_ss) |arr| {
+                for (0..per_ss_done) |i| {
+                    if (arr[i]) |s| self.allocator.free(s);
+                }
+                self.allocator.free(arr);
+            }
+        }
+        if (self.ss) |arr| {
+            new_per_ss = try self.allocator.alloc(?[]const u8, n);
+            for (0..n) |i| {
+                if (arr[i]) |ann| {
+                    // Fix broken base pairs at original length, then select columns.
+                    const fixed = try fixBrokenBasepairs(self.allocator, ann, mask);
+                    defer self.allocator.free(fixed);
+                    const buf = try self.allocator.alloc(u8, new_alen);
+                    var col: usize = 0;
+                    for (0..self.alen) |c| {
+                        if (mask[c]) {
+                            buf[col] = fixed[c];
+                            col += 1;
+                        }
+                    }
+                    new_per_ss.?[i] = buf;
+                } else {
+                    new_per_ss.?[i] = null;
+                }
+                per_ss_done += 1;
+            }
+        }
+
+        var new_per_sa: ?[]?[]const u8 = null;
+        var per_sa_done: usize = 0;
+        errdefer {
+            if (new_per_sa) |arr| {
+                for (0..per_sa_done) |i| {
+                    if (arr[i]) |s| self.allocator.free(s);
+                }
+                self.allocator.free(arr);
+            }
+        }
+        if (self.sa) |arr| {
+            new_per_sa = try self.allocator.alloc(?[]const u8, n);
+            for (0..n) |i| {
+                if (arr[i]) |ann| {
+                    const buf = try self.allocator.alloc(u8, new_alen);
+                    var col: usize = 0;
+                    for (0..self.alen) |c| {
+                        if (mask[c]) {
+                            buf[col] = ann[c];
+                            col += 1;
+                        }
+                    }
+                    new_per_sa.?[i] = buf;
+                } else {
+                    new_per_sa.?[i] = null;
+                }
+                per_sa_done += 1;
+            }
+        }
+
+        var new_per_pp: ?[]?[]const u8 = null;
+        var per_pp_done: usize = 0;
+        errdefer {
+            if (new_per_pp) |arr| {
+                for (0..per_pp_done) |i| {
+                    if (arr[i]) |s| self.allocator.free(s);
+                }
+                self.allocator.free(arr);
+            }
+        }
+        if (self.pp) |arr| {
+            new_per_pp = try self.allocator.alloc(?[]const u8, n);
+            for (0..n) |i| {
+                if (arr[i]) |ann| {
+                    const buf = try self.allocator.alloc(u8, new_alen);
+                    var col: usize = 0;
+                    for (0..self.alen) |c| {
+                        if (mask[c]) {
+                            buf[col] = ann[c];
+                            col += 1;
+                        }
+                    }
+                    new_per_pp.?[i] = buf;
+                } else {
+                    new_per_pp.?[i] = null;
+                }
+                per_pp_done += 1;
+            }
         }
 
         // Copy weights
@@ -453,6 +653,12 @@ pub const Msa = struct {
             .weights = new_weights,
             .consensus_ss = new_ss,
             .reference = new_rf,
+            .sa_cons = new_sa_cons,
+            .pp_cons = new_pp_cons,
+            .mm = new_mm,
+            .ss = new_per_ss,
+            .sa = new_per_sa,
+            .pp = new_per_pp,
         };
     }
 
@@ -515,6 +721,49 @@ pub const Msa = struct {
             new_seq_desc = try self.allocator.alloc(?[]const u8, nnew);
         }
 
+        // Per-sequence SS/SA/PP
+        var new_per_ss: ?[]?[]const u8 = null;
+        var per_ss_done: usize = 0;
+        errdefer {
+            if (new_per_ss) |arr| {
+                for (0..per_ss_done) |i| {
+                    if (arr[i]) |s| self.allocator.free(s);
+                }
+                self.allocator.free(arr);
+            }
+        }
+        if (self.ss != null) {
+            new_per_ss = try self.allocator.alloc(?[]const u8, nnew);
+        }
+
+        var new_per_sa: ?[]?[]const u8 = null;
+        var per_sa_done: usize = 0;
+        errdefer {
+            if (new_per_sa) |arr| {
+                for (0..per_sa_done) |i| {
+                    if (arr[i]) |s| self.allocator.free(s);
+                }
+                self.allocator.free(arr);
+            }
+        }
+        if (self.sa != null) {
+            new_per_sa = try self.allocator.alloc(?[]const u8, nnew);
+        }
+
+        var new_per_pp: ?[]?[]const u8 = null;
+        var per_pp_done: usize = 0;
+        errdefer {
+            if (new_per_pp) |arr| {
+                for (0..per_pp_done) |i| {
+                    if (arr[i]) |s| self.allocator.free(s);
+                }
+                self.allocator.free(arr);
+            }
+        }
+        if (self.pp != null) {
+            new_per_pp = try self.allocator.alloc(?[]const u8, nnew);
+        }
+
         var nidx: usize = 0;
         for (0..self.names.len) |oidx| {
             if (useme[oidx]) {
@@ -533,6 +782,18 @@ pub const Msa = struct {
                     new_seq_desc.?[nidx] = if (descs[oidx]) |d| try self.allocator.dupe(u8, d) else null;
                     seq_desc_done += 1;
                 }
+                if (self.ss) |arr| {
+                    new_per_ss.?[nidx] = if (arr[oidx]) |s| try self.allocator.dupe(u8, s) else null;
+                    per_ss_done += 1;
+                }
+                if (self.sa) |arr| {
+                    new_per_sa.?[nidx] = if (arr[oidx]) |s| try self.allocator.dupe(u8, s) else null;
+                    per_sa_done += 1;
+                }
+                if (self.pp) |arr| {
+                    new_per_pp.?[nidx] = if (arr[oidx]) |s| try self.allocator.dupe(u8, s) else null;
+                    per_pp_done += 1;
+                }
                 nidx += 1;
             }
         }
@@ -550,8 +811,14 @@ pub const Msa = struct {
             .weights = new_weights,
             .consensus_ss = if (self.consensus_ss) |v| try self.allocator.dupe(u8, v) else null,
             .reference = if (self.reference) |v| try self.allocator.dupe(u8, v) else null,
+            .sa_cons = if (self.sa_cons) |v| try self.allocator.dupe(u8, v) else null,
+            .pp_cons = if (self.pp_cons) |v| try self.allocator.dupe(u8, v) else null,
+            .mm = if (self.mm) |v| try self.allocator.dupe(u8, v) else null,
             .seq_accessions = new_seq_acc,
             .seq_descriptions = new_seq_desc,
+            .ss = new_per_ss,
+            .sa = new_per_sa,
+            .pp = new_per_pp,
         };
     }
 
@@ -777,6 +1044,27 @@ pub const Msa = struct {
         if (self.weights) |w| self.allocator.free(w);
         if (self.consensus_ss) |ss| self.allocator.free(ss);
         if (self.reference) |rf| self.allocator.free(rf);
+        if (self.sa_cons) |v| self.allocator.free(v);
+        if (self.pp_cons) |v| self.allocator.free(v);
+        if (self.mm) |v| self.allocator.free(v);
+        if (self.ss) |arr| {
+            for (arr) |entry| {
+                if (entry) |s| self.allocator.free(s);
+            }
+            self.allocator.free(arr);
+        }
+        if (self.sa) |arr| {
+            for (arr) |entry| {
+                if (entry) |s| self.allocator.free(s);
+            }
+            self.allocator.free(arr);
+        }
+        if (self.pp) |arr| {
+            for (arr) |entry| {
+                if (entry) |s| self.allocator.free(s);
+            }
+            self.allocator.free(arr);
+        }
         if (self.seq_accessions) |accs| {
             for (accs) |acc| {
                 if (acc) |a| self.allocator.free(a);
@@ -821,6 +1109,35 @@ pub const Msa = struct {
         }
     }
 };
+
+/// Fix broken base pairs in a WUSS SS string given a column-keep mask.
+/// `ss` is the original (full-length) SS annotation. `keep` has the same length.
+/// Returns a new string of the same length as `ss` with broken pairs replaced by '.'.
+/// A pair is broken if either partner is in a removed column (!keep).
+fn fixBrokenBasepairs(allocator: Allocator, ss: []const u8, keep: []const bool) ![]u8 {
+    std.debug.assert(ss.len == keep.len);
+
+    const pairs = wuss.parseToPairs(allocator, ss) catch {
+        // If SS is already malformed, just return a copy.
+        return try allocator.dupe(u8, ss);
+    };
+    defer allocator.free(pairs);
+
+    const result = try allocator.alloc(u8, ss.len);
+    @memcpy(result, ss);
+
+    for (0..ss.len) |i| {
+        if (pairs[i] >= 0) {
+            const partner: usize = @intCast(pairs[i]);
+            if (!keep[i] or !keep[partner]) {
+                result[i] = '.';
+                result[partner] = '.';
+            }
+        }
+    }
+
+    return result;
+}
 
 // --- Tests ---
 
@@ -1416,4 +1733,152 @@ test "selectColumns: preserves consensus_ss and reference" {
 
     try std.testing.expectEqualStrings("<>", sub.consensus_ss.?);
     try std.testing.expectEqualStrings("xx", sub.reference.?);
+}
+
+test "setSeqSS, setSeqSA, setSeqPP" {
+    const allocator = std.testing.allocator;
+    const abc = &alphabet_mod.dna;
+
+    const names = [_][]const u8{ "s1", "s2" };
+    const seqs = [_][]const u8{ "ACGT", "TGCA" };
+
+    var msa = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer msa.deinit();
+
+    try msa.setSeqSS(0, "<..>");
+    try msa.setSeqSA(0, "1234");
+    try msa.setSeqPP(1, "****");
+
+    try std.testing.expectEqualStrings("<..>", msa.ss.?[0].?);
+    try std.testing.expectEqual(@as(?[]const u8, null), msa.ss.?[1]);
+    try std.testing.expectEqualStrings("1234", msa.sa.?[0].?);
+    try std.testing.expectEqual(@as(?[]const u8, null), msa.sa.?[1]);
+    try std.testing.expectEqual(@as(?[]const u8, null), msa.pp.?[0]);
+    try std.testing.expectEqualStrings("****", msa.pp.?[1].?);
+}
+
+test "selectColumns: propagates per-sequence SS/SA/PP and consensus sa_cons/pp_cons/mm" {
+    const allocator = std.testing.allocator;
+    const abc = &alphabet_mod.dna;
+
+    const names = [_][]const u8{ "s1", "s2" };
+    const seqs = [_][]const u8{ "ACGTA", "TGCAT" };
+
+    var msa = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer msa.deinit();
+
+    try msa.setSeqSS(0, "<<.>>");
+    try msa.setSeqSA(0, "12345");
+    try msa.setSeqPP(1, "*****");
+    msa.sa_cons = try allocator.dupe(u8, "abcde");
+    msa.pp_cons = try allocator.dupe(u8, "56789");
+    msa.mm = try allocator.dupe(u8, "mMmMm");
+
+    // Select columns 0, 2, 4
+    const mask = [_]bool{ true, false, true, false, true };
+    var sub = try msa.selectColumns(&mask);
+    defer sub.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), sub.alen);
+    try std.testing.expectEqualStrings("12345"[0..1] ++ "12345"[2..3] ++ "12345"[4..5], sub.sa.?[0].?);
+    try std.testing.expectEqualStrings("*****"[0..1] ++ "*****"[2..3] ++ "*****"[4..5], sub.pp.?[1].?);
+    try std.testing.expectEqualStrings("ace", sub.sa_cons.?);
+    try std.testing.expectEqualStrings("579", sub.pp_cons.?);
+    try std.testing.expectEqualStrings("mmm", sub.mm.?);
+}
+
+test "selectColumns: fixes broken base pairs in consensus SS" {
+    const allocator = std.testing.allocator;
+    const abc = &alphabet_mod.dna;
+
+    const names = [_][]const u8{"s1"};
+    const seqs = [_][]const u8{"ACGTAA"};
+
+    var msa = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer msa.deinit();
+    // SS: <<..>> means 0-5 paired, 1-4 paired
+    msa.consensus_ss = try allocator.dupe(u8, "<<..>>");
+
+    // Remove column 0: pair (0,5) is broken
+    const mask = [_]bool{ false, true, true, true, true, true };
+    var sub = try msa.selectColumns(&mask);
+    defer sub.deinit();
+
+    // Position 0 was removed; its partner (5) should now be '.'
+    // Result after fixing and selecting: position 1 paired with 4 still intact
+    // Original after fix: ".<..>." -> select columns 1..5 -> "<..>."
+    try std.testing.expectEqual(@as(usize, 5), sub.alen);
+    try std.testing.expectEqualStrings("<..>.", sub.consensus_ss.?);
+}
+
+test "selectColumns: fixes broken base pairs in per-sequence SS" {
+    const allocator = std.testing.allocator;
+    const abc = &alphabet_mod.dna;
+
+    const names = [_][]const u8{"s1"};
+    const seqs = [_][]const u8{"ACGTAA"};
+
+    var msa = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer msa.deinit();
+
+    try msa.setSeqSS(0, "<<..>>");
+
+    // Remove column 5: pair (0,5) is broken
+    const mask = [_]bool{ true, true, true, true, true, false };
+    var sub = try msa.selectColumns(&mask);
+    defer sub.deinit();
+
+    // After fix: ".<..>." -> select 0..4 -> ".<..>"
+    try std.testing.expectEqual(@as(usize, 5), sub.alen);
+    try std.testing.expectEqualStrings(".<..>", sub.ss.?[0].?);
+}
+
+test "sequenceSubset: propagates per-sequence SS/SA/PP" {
+    const allocator = std.testing.allocator;
+    const abc = &alphabet_mod.dna;
+
+    const names = [_][]const u8{ "s1", "s2", "s3" };
+    const seqs = [_][]const u8{ "ACGT", "TGCA", "AAAA" };
+
+    var msa = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer msa.deinit();
+
+    try msa.setSeqSS(0, "<..>");
+    try msa.setSeqSS(2, "(())");
+    try msa.setSeqPP(1, "****");
+
+    const useme = [_]bool{ true, false, true };
+    var sub = try msa.sequenceSubset(&useme);
+    defer sub.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), sub.nseq());
+    try std.testing.expect(sub.ss != null);
+    try std.testing.expectEqualStrings("<..>", sub.ss.?[0].?);
+    try std.testing.expectEqualStrings("(())", sub.ss.?[1].?);
+    // PP was only on s2 which was removed; s1 and s3 had no PP
+    try std.testing.expect(sub.pp != null);
+    try std.testing.expectEqual(@as(?[]const u8, null), sub.pp.?[0]);
+    try std.testing.expectEqual(@as(?[]const u8, null), sub.pp.?[1]);
+}
+
+test "sequenceSubset: propagates consensus sa_cons/pp_cons/mm" {
+    const allocator = std.testing.allocator;
+    const abc = &alphabet_mod.dna;
+
+    const names = [_][]const u8{ "s1", "s2" };
+    const seqs = [_][]const u8{ "ACGT", "TGCA" };
+
+    var msa = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer msa.deinit();
+    msa.sa_cons = try allocator.dupe(u8, "abcd");
+    msa.pp_cons = try allocator.dupe(u8, "1234");
+    msa.mm = try allocator.dupe(u8, "mmmm");
+
+    const useme = [_]bool{ true, false };
+    var sub = try msa.sequenceSubset(&useme);
+    defer sub.deinit();
+
+    try std.testing.expectEqualStrings("abcd", sub.sa_cons.?);
+    try std.testing.expectEqualStrings("1234", sub.pp_cons.?);
+    try std.testing.expectEqualStrings("mmmm", sub.mm.?);
 }
