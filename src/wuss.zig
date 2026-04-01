@@ -240,12 +240,264 @@ pub fn pairsToWuss(allocator: Allocator, pairs: []const i32) ![]u8 {
     return buf;
 }
 
+/// Assign pairs to non-crossing layers using greedy planarity.
+/// Layer 0 is the main (non-crossing) structure; higher layers are pseudoknots.
+fn assignPairLayers(allocator: Allocator, all_pairs: [][2]usize, max_layers: u8) ![]u8 {
+    const pair_count = all_pairs.len;
+    const pair_layer = try allocator.alloc(u8, pair_count);
+    errdefer allocator.free(pair_layer);
+    @memset(pair_layer, 0xff);
+
+    for (0..max_layers) |layer| {
+        for (0..pair_count) |k| {
+            if (pair_layer[k] != 0xff) continue;
+            var crosses = false;
+            for (0..pair_count) |m| {
+                if (pair_layer[m] != layer) continue;
+                const a = all_pairs[k][0];
+                const b_val = all_pairs[k][1];
+                const c = all_pairs[m][0];
+                const d = all_pairs[m][1];
+                if ((a < c and c < b_val and b_val < d) or (c < a and a < d and d < b_val)) {
+                    crosses = true;
+                    break;
+                }
+            }
+            if (!crosses) {
+                pair_layer[k] = @intCast(layer);
+            }
+        }
+    }
+
+    for (pair_layer) |l| {
+        if (l == 0xff) {
+            allocator.free(pair_layer);
+            return error.TooManyPseudoknots;
+        }
+    }
+
+    return pair_layer;
+}
+
+/// Collect validated base pairs (i < j) from a connectivity table.
+fn collectPairs(allocator: Allocator, ct: []const ?usize, len: usize) !std.ArrayList([2]usize) {
+    var pairs: std.ArrayList([2]usize) = .empty;
+    errdefer pairs.deinit(allocator);
+
+    for (0..len) |i| {
+        if (ct[i]) |j| {
+            if (j < len and j > i) {
+                if (ct[j]) |back| {
+                    if (back == i) {
+                        try pairs.append(allocator, .{ i, j });
+                    }
+                }
+            }
+        }
+    }
+    return pairs;
+}
+
+/// Convert a connectivity table (CT) to full WUSS notation with structural context.
+///
+/// CT format: `ct[i] = j` means position i is paired with position j (0-indexed),
+/// `ct[i] = null` means unpaired.
+///
+/// Paired positions use bracket types based on structural context:
+/// - `<>` for stems closing hairpin loops (innermost pairs with no nested pairs)
+/// - `()` for stems enclosing other stems (internal loops, multifurcations)
+/// - `[]` and `{}` for pseudoknot pairs (crossing pairs at increasing depth)
+///
+/// Unpaired positions use context characters:
+/// - `_` hairpin loop (between closing pair halves with no nested pairs inside)
+/// - `-` bulge or interior loop (between stems, one or both sides)
+/// - `,` multifurcation loop (between two or more stems inside enclosing pair)
+/// - `:` external (outside all base pairs)
+pub fn ct2wuss(allocator: Allocator, ct: []const ?usize, n: usize) ![]u8 {
+    if (n == 0) return try allocator.alloc(u8, 0);
+
+    const len = @min(n, ct.len);
+    const buf = try allocator.alloc(u8, len);
+    errdefer allocator.free(buf);
+    @memset(buf, '.');
+
+    var all_pairs_list = try collectPairs(allocator, ct, len);
+    defer all_pairs_list.deinit(allocator);
+
+    const pair_count = all_pairs_list.items.len;
+    if (pair_count == 0) {
+        @memset(buf, ':');
+        return buf;
+    }
+
+    const all_pairs = all_pairs_list.items;
+
+    const pair_layer = try assignPairLayers(allocator, all_pairs, 4);
+    defer allocator.free(pair_layer);
+
+    // Build a lookup: for each position, which pair index (or null).
+    const pos_to_pair = try allocator.alloc(?usize, len);
+    defer allocator.free(pos_to_pair);
+    @memset(pos_to_pair, null);
+
+    for (all_pairs, 0..) |pair, k| {
+        pos_to_pair[pair[0]] = k;
+        pos_to_pair[pair[1]] = k;
+    }
+
+    // For layer-0 pairs, classify structural context.
+    for (0..pair_count) |k| {
+        if (pair_layer[k] != 0) continue;
+        const pi = all_pairs[k][0];
+        const pj = all_pairs[k][1];
+
+        var nested_stems: usize = 0;
+        for (0..pair_count) |m| {
+            if (m == k) continue;
+            if (pair_layer[m] != 0) continue;
+            if (all_pairs[m][0] > pi and all_pairs[m][1] < pj) {
+                nested_stems += 1;
+            }
+        }
+
+        if (nested_stems == 0) {
+            buf[pi] = '<';
+            buf[pj] = '>';
+        } else {
+            buf[pi] = '(';
+            buf[pj] = ')';
+        }
+    }
+
+    // Pseudoknot layers get [] and {}
+    const pk_open = [_]u8{ '[', '{' };
+    const pk_close = [_]u8{ ']', '}' };
+    for (0..pair_count) |k| {
+        const layer = pair_layer[k];
+        if (layer == 0) continue;
+        const bracket_idx = layer - 1;
+        if (bracket_idx < pk_open.len) {
+            buf[all_pairs[k][0]] = pk_open[bracket_idx];
+            buf[all_pairs[k][1]] = pk_close[bracket_idx];
+        } else {
+            buf[all_pairs[k][0]] = '[';
+            buf[all_pairs[k][1]] = ']';
+        }
+    }
+
+    // Classify unpaired positions.
+    for (0..len) |i| {
+        if (pos_to_pair[i] != null) continue;
+
+        // Find enclosing layer-0 base pair (innermost).
+        var best_k: ?usize = null;
+        var best_span: usize = std.math.maxInt(usize);
+        for (all_pairs, 0..) |pair, k| {
+            if (pair_layer[k] != 0) continue;
+            if (pair[0] < i and i < pair[1]) {
+                const span = pair[1] - pair[0];
+                if (span < best_span) {
+                    best_span = span;
+                    best_k = k;
+                }
+            }
+        }
+
+        if (best_k == null) {
+            buf[i] = ':';
+        } else {
+            const ek = best_k.?;
+            const ei = all_pairs[ek][0];
+            const ej = all_pairs[ek][1];
+
+            // Count directly nested layer-0 stems inside (ei, ej).
+            var direct_stems: usize = 0;
+            for (all_pairs, 0..) |pair, m| {
+                if (pair_layer[m] != 0) continue;
+                if (m == ek) continue;
+                const mi = pair[0];
+                const mj = pair[1];
+                if (mi <= ei or mj >= ej) continue;
+
+                var is_direct = true;
+                for (all_pairs, 0..) |other, o| {
+                    if (pair_layer[o] != 0) continue;
+                    if (o == ek or o == m) continue;
+                    if (other[0] > ei and other[1] < ej and other[0] < mi and mj < other[1]) {
+                        is_direct = false;
+                        break;
+                    }
+                }
+                if (is_direct) direct_stems += 1;
+            }
+
+            if (direct_stems == 0) {
+                buf[i] = '_';
+            } else if (direct_stems == 1) {
+                buf[i] = '-';
+            } else {
+                buf[i] = ',';
+            }
+        }
+    }
+
+    return buf;
+}
+
+/// Convert a connectivity table (CT) to simplified WUSS notation.
+///
+/// All base pairs use `<>`, pseudoknot pairs use `Aa`..`Zz` alphabetic notation,
+/// and unpaired positions are `.`.
+///
+/// CT format: `ct[i] = j` means position i is paired with position j (0-indexed),
+/// `ct[i] = null` means unpaired.
+pub fn ct2simplewuss(allocator: Allocator, ct: []const ?usize, n: usize) ![]u8 {
+    if (n == 0) return try allocator.alloc(u8, 0);
+
+    const len = @min(n, ct.len);
+    const buf = try allocator.alloc(u8, len);
+    errdefer allocator.free(buf);
+    @memset(buf, '.');
+
+    var all_pairs_list = try collectPairs(allocator, ct, len);
+    defer all_pairs_list.deinit(allocator);
+
+    const pair_count = all_pairs_list.items.len;
+    if (pair_count == 0) return buf;
+
+    const all_pairs = all_pairs_list.items;
+
+    const pair_layer = try assignPairLayers(allocator, all_pairs, 27);
+    defer allocator.free(pair_layer);
+
+    for (0..pair_count) |k| {
+        const layer = pair_layer[k];
+        const pi = all_pairs[k][0];
+        const pj = all_pairs[k][1];
+        if (layer == 0) {
+            buf[pi] = '<';
+            buf[pj] = '>';
+        } else {
+            const letter: u8 = @intCast(layer - 1);
+            if (letter < 26) {
+                buf[pi] = 'a' + letter;
+                buf[pj] = 'A' + letter;
+            } else {
+                buf[pi] = 'z';
+                buf[pj] = 'Z';
+            }
+        }
+    }
+
+    return buf;
+}
+
 // --- Tests ---
 
 test "parseToPairs: ((...)) gives expected pair table" {
     // pairs[0]=6, pairs[1]=5, pairs[2..4]=-1, pairs[5]=1, pairs[6]=0
     const allocator = std.testing.allocator;
-    const pairs = try parseToPairs(allocator, "((...))" );
+    const pairs = try parseToPairs(allocator, "((...))");
     defer allocator.free(pairs);
     try std.testing.expectEqual(@as(i32, 6), pairs[0]);
     try std.testing.expectEqual(@as(i32, 5), pairs[1]);
@@ -395,4 +647,102 @@ test "pairsToWuss: round-trip non-crossing pairs all get parens" {
     const wuss = try pairsToWuss(allocator, pairs);
     defer allocator.free(wuss);
     try std.testing.expectEqualStrings("((..((..))..))", wuss);
+}
+
+test "ct2wuss: simple hairpin" {
+    // CT: 0-8, 1-7, 2-6 paired, 3,4,5 unpaired (hairpin loop)
+    const allocator = std.testing.allocator;
+    const ct = [_]?usize{ 8, 7, 6, null, null, null, 2, 1, 0 };
+    const result = try ct2wuss(allocator, &ct, 9);
+    defer allocator.free(result);
+    // Inner pair (2,6) encloses no other pairs -> <>, outer pairs enclose stems -> ()
+    // Positions 3,4,5 are in hairpin -> '_'
+    try std.testing.expectEqualStrings("((<___>))", result);
+}
+
+test "ct2wuss: external unpaired" {
+    // Leading/trailing unpaired should be ':'
+    const allocator = std.testing.allocator;
+    const ct = [_]?usize{ null, null, null, 11, 10, 9, null, null, null, 5, 4, 3, null, null, null };
+    const result = try ct2wuss(allocator, &ct, 15);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings(":::((<___>)):::", result);
+}
+
+test "ct2wuss: bulge/interior loop" {
+    // Pair (0,11) (1,10) enclose pair (3,8)(4,7), positions 2 and 9 are bulge/interior
+    const allocator = std.testing.allocator;
+    const ct = [_]?usize{ 11, 10, null, 8, 7, null, null, 4, 3, null, 1, 0 };
+    const result = try ct2wuss(allocator, &ct, 12);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("((-(<__>)-))", result);
+}
+
+test "ct2wuss: multifurcation loop" {
+    // Two stems inside one enclosing pair
+    const allocator = std.testing.allocator;
+    const ct = [_]?usize{
+        19,   null, 8,    7,    null, null, null, 3,    2,    null,
+        null, 17,   16,   null, null, null, 12,   11,   null, 0,
+    };
+    const result = try ct2wuss(allocator, &ct, 20);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("(,(<___>),,(<___>),)", result);
+}
+
+test "ct2wuss: all unpaired" {
+    const allocator = std.testing.allocator;
+    const ct = [_]?usize{ null, null, null, null };
+    const result = try ct2wuss(allocator, &ct, 4);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("::::", result);
+}
+
+test "ct2wuss: empty input" {
+    const allocator = std.testing.allocator;
+    const ct = [_]?usize{};
+    const result = try ct2wuss(allocator, &ct, 0);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("", result);
+}
+
+test "ct2wuss: single hairpin no nesting" {
+    const allocator = std.testing.allocator;
+    const ct = [_]?usize{ 5, null, null, null, null, 0 };
+    const result = try ct2wuss(allocator, &ct, 6);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("<____>", result);
+}
+
+test "ct2simplewuss: basic pairs" {
+    const allocator = std.testing.allocator;
+    const ct = [_]?usize{ 8, 7, 6, null, null, null, 2, 1, 0 };
+    const result = try ct2simplewuss(allocator, &ct, 9);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("<<<...>>>", result);
+}
+
+test "ct2simplewuss: all unpaired" {
+    const allocator = std.testing.allocator;
+    const ct = [_]?usize{ null, null, null };
+    const result = try ct2simplewuss(allocator, &ct, 3);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("...", result);
+}
+
+test "ct2simplewuss: pseudoknot uses alphabetic pairs" {
+    // Crossing pairs: (0,5) and (2,7) cross.
+    const allocator = std.testing.allocator;
+    const ct = [_]?usize{ 5, null, 7, null, null, 0, null, 2 };
+    const result = try ct2simplewuss(allocator, &ct, 8);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("<.a..>.A", result);
+}
+
+test "ct2simplewuss: empty input" {
+    const allocator = std.testing.allocator;
+    const ct = [_]?usize{};
+    const result = try ct2simplewuss(allocator, &ct, 0);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("", result);
 }
