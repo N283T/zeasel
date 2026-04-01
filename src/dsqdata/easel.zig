@@ -191,6 +191,142 @@ pub const EaselDsqData = struct {
         };
     }
 
+    /// Seek to and read a specific sequence by index (0-based).
+    /// Returns null if seq_idx is out of range.
+    /// Does NOT update current_seq (random access doesn't affect sequential cursor).
+    pub fn readSequence(self: *EaselDsqData, allocator: Allocator, abc: *const Alphabet, seq_idx: u64) !?Sequence {
+        if (seq_idx >= self.num_sequences) return null;
+
+        // Read the index record for this sequence and (if needed) the previous one.
+        // Index records start at offset 56 (header size), each is 16 bytes.
+        const idx_offset = 56 + seq_idx * 16;
+
+        var idx_buf: [16]u8 = undefined;
+        _ = try self.idx_file.preadAll(&idx_buf, idx_offset);
+
+        const meta_end: u64 = @bitCast(std.mem.readInt(i64, idx_buf[0..8], .little));
+        const psq_end: u64 = @bitCast(std.mem.readInt(i64, idx_buf[8..16], .little));
+
+        // Compute start offsets: first seq starts at 8 (after file headers),
+        // subsequent seqs start at the previous record's end offset.
+        var meta_start: u64 = 8;
+        var psq_start: u64 = 8;
+
+        if (seq_idx > 0) {
+            const prev_idx_offset = 56 + (seq_idx - 1) * 16;
+            var prev_buf: [16]u8 = undefined;
+            _ = try self.idx_file.preadAll(&prev_buf, prev_idx_offset);
+            meta_start = @bitCast(std.mem.readInt(i64, prev_buf[0..8], .little));
+            psq_start = @bitCast(std.mem.readInt(i64, prev_buf[8..16], .little));
+        }
+
+        // Read metadata via positional read
+        const meta_len = meta_end - meta_start;
+        const meta_data = try allocator.alloc(u8, meta_len);
+        defer allocator.free(meta_data);
+        _ = try self.meta_file.preadAll(meta_data, meta_start);
+
+        // Parse metadata: name\0, accession\0, description\0, taxonomy_id(i32)
+        var pos: usize = 0;
+        const name_end = std.mem.indexOfScalarPos(u8, meta_data, pos, 0) orelse return error.InvalidFormat;
+        const name = try allocator.dupe(u8, meta_data[pos..name_end]);
+        errdefer allocator.free(name);
+        pos = name_end + 1;
+
+        const acc_end = std.mem.indexOfScalarPos(u8, meta_data, pos, 0) orelse return error.InvalidFormat;
+        const acc_raw = try allocator.dupe(u8, meta_data[pos..acc_end]);
+        errdefer allocator.free(acc_raw);
+        pos = acc_end + 1;
+
+        const desc_end = std.mem.indexOfScalarPos(u8, meta_data, pos, 0) orelse return error.InvalidFormat;
+        const desc_raw = try allocator.dupe(u8, meta_data[pos..desc_end]);
+        errdefer allocator.free(desc_raw);
+        pos = desc_end + 1;
+
+        if (pos + 4 > meta_data.len) return error.InvalidFormat;
+        const taxonomy_id = std.mem.readInt(i32, meta_data[pos..][0..4], .little);
+
+        // Read packet data via positional read
+        const psq_len = psq_end - psq_start;
+        const psq_data = try allocator.alloc(u8, psq_len);
+        defer allocator.free(psq_data);
+        _ = try self.seq_file.preadAll(psq_data, psq_start);
+
+        // Parse packets (each is 4 bytes, little-endian)
+        const num_packets = psq_len / 4;
+        var packets = try allocator.alloc(u32, num_packets);
+        defer allocator.free(packets);
+        for (0..num_packets) |i| {
+            const offset = i * 4;
+            packets[i] = std.mem.readInt(u32, psq_data[offset..][0..4], .little);
+        }
+
+        // Count residues and unpack
+        const is_amino = (self.alphabet_type == .amino);
+        const seq_len = countResiduesFromPackets(packets, is_amino);
+        const dsq = if (is_amino)
+            try pack.unpack5(allocator, packets, seq_len)
+        else
+            try pack.unpack2(allocator, packets, seq_len);
+        errdefer allocator.free(dsq);
+
+        // Convert empty strings to null
+        const accession: ?[]const u8 = if (acc_raw.len == 0) blk: {
+            allocator.free(acc_raw);
+            break :blk null;
+        } else acc_raw;
+
+        const description: ?[]const u8 = if (desc_raw.len == 0) blk: {
+            allocator.free(desc_raw);
+            break :blk null;
+        } else desc_raw;
+
+        const tax_id: ?i32 = if (taxonomy_id == -1) null else taxonomy_id;
+
+        return Sequence{
+            .name = name,
+            .accession = accession,
+            .description = description,
+            .taxonomy_id = tax_id,
+            .dsq = dsq,
+            .secondary_structure = null,
+            .source = null,
+            .abc = abc,
+            .allocator = allocator,
+        };
+    }
+
+    /// Read a chunk of sequences starting at seq_idx.
+    /// Returns up to max_seqs sequences. Caller owns the returned slice and each Sequence.
+    pub fn readChunk(self: *EaselDsqData, allocator: Allocator, abc: *const Alphabet, seq_idx: u64, max_seqs: usize) ![]Sequence {
+        if (seq_idx >= self.num_sequences) return allocator.alloc(Sequence, 0);
+
+        const available = self.num_sequences - seq_idx;
+        const count: usize = @intCast(@min(available, @as(u64, max_seqs)));
+
+        var sequences = try allocator.alloc(Sequence, count);
+        var read_count: usize = 0;
+        errdefer {
+            for (0..read_count) |i| {
+                var s = sequences[i];
+                s.deinit();
+            }
+            allocator.free(sequences);
+        }
+
+        for (0..count) |i| {
+            const seq = try self.readSequence(allocator, abc, seq_idx + @as(u64, @intCast(i))) orelse break;
+            sequences[i] = seq;
+            read_count += 1;
+        }
+
+        if (read_count < count) {
+            sequences = try allocator.realloc(sequences, read_count);
+        }
+
+        return sequences;
+    }
+
     pub fn deinit(self: *EaselDsqData) void {
         self.idx_file.close();
         self.meta_file.close();
@@ -499,4 +635,164 @@ test "EaselDsqData.readNext: reads multiple DNA sequences" {
     // No more
     const next = try db.readNext(allocator, &alphabet_mod.dna);
     try std.testing.expect(next == null);
+}
+
+test "EaselDsqData.readSequence: random access by index" {
+    const allocator = std.testing.allocator;
+
+    // Create a 3-sequence amino database.
+    // Seq 0: A(0), C(1) -> 2 residues
+    const pkt0: u32 = pack.EOD | pack.FIVEBIT |
+        (@as(u32, 0) << 25) |
+        (@as(u32, 1) << 20) |
+        (@as(u32, 31) << 15) |
+        (@as(u32, 31) << 10) |
+        (@as(u32, 31) << 5) |
+        (@as(u32, 31) << 0);
+
+    // Seq 1: D(2), E(3), F(4) -> 3 residues
+    const pkt1: u32 = pack.EOD | pack.FIVEBIT |
+        (@as(u32, 2) << 25) |
+        (@as(u32, 3) << 20) |
+        (@as(u32, 4) << 15) |
+        (@as(u32, 31) << 10) |
+        (@as(u32, 31) << 5) |
+        (@as(u32, 31) << 0);
+
+    // Seq 2: G(5), H(6), I(7), K(8) -> 4 residues
+    const pkt2: u32 = pack.EOD | pack.FIVEBIT |
+        (@as(u32, 5) << 25) |
+        (@as(u32, 6) << 20) |
+        (@as(u32, 7) << 15) |
+        (@as(u32, 8) << 10) |
+        (@as(u32, 31) << 5) |
+        (@as(u32, 31) << 0);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const packets0 = [_]u32{pkt0};
+    const packets1 = [_]u32{pkt1};
+    const packets2 = [_]u32{pkt2};
+    const names = [_][]const u8{ "seq_alpha", "seq_beta", "seq_gamma" };
+    const pkt_seqs = [_][]const u32{ &packets0, &packets1, &packets2 };
+    const lens = [_]u64{ 2, 3, 4 };
+
+    try writeTestEaselDb(tmp.dir, "randtest", 0xDEADBEEF, 3, &names, &pkt_seqs, &lens);
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try tmp.dir.realpath(".", &path_buf);
+    const full_path = try std.fmt.allocPrint(allocator, "{s}/randtest", .{dir_path});
+    defer allocator.free(full_path);
+
+    var db = try EaselDsqData.open(allocator, full_path);
+    defer db.deinit();
+
+    // Read sequence 2 (0-indexed) first — out of order
+    {
+        var seq = (try db.readSequence(allocator, &alphabet_mod.amino, 2)).?;
+        defer seq.deinit();
+        try std.testing.expectEqualStrings("seq_gamma", seq.name);
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 5, 6, 7, 8 }, seq.dsq);
+    }
+
+    // Read sequence 0
+    {
+        var seq = (try db.readSequence(allocator, &alphabet_mod.amino, 0)).?;
+        defer seq.deinit();
+        try std.testing.expectEqualStrings("seq_alpha", seq.name);
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1 }, seq.dsq);
+    }
+
+    // Read sequence 1
+    {
+        var seq = (try db.readSequence(allocator, &alphabet_mod.amino, 1)).?;
+        defer seq.deinit();
+        try std.testing.expectEqualStrings("seq_beta", seq.name);
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 2, 3, 4 }, seq.dsq);
+    }
+
+    // Out-of-range returns null
+    const out = try db.readSequence(allocator, &alphabet_mod.amino, 3);
+    try std.testing.expect(out == null);
+
+    // Verify sequential cursor is unaffected
+    try std.testing.expectEqual(@as(u64, 0), db.current_seq);
+}
+
+test "EaselDsqData.readChunk: read subset of sequences" {
+    const allocator = std.testing.allocator;
+
+    // Create a 5-sequence amino database.
+    const make_pkt = struct {
+        fn f(code: u32) u32 {
+            return pack.EOD | pack.FIVEBIT |
+                (code << 25) |
+                (@as(u32, 31) << 20) |
+                (@as(u32, 31) << 15) |
+                (@as(u32, 31) << 10) |
+                (@as(u32, 31) << 5) |
+                (@as(u32, 31) << 0);
+        }
+    }.f;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const pkts = [5][1]u32{
+        .{make_pkt(0)},
+        .{make_pkt(1)},
+        .{make_pkt(2)},
+        .{make_pkt(3)},
+        .{make_pkt(4)},
+    };
+
+    const names = [_][]const u8{ "s0", "s1", "s2", "s3", "s4" };
+    const pkt_seqs = [_][]const u32{ &pkts[0], &pkts[1], &pkts[2], &pkts[3], &pkts[4] };
+    const lens = [_]u64{ 1, 1, 1, 1, 1 };
+
+    try writeTestEaselDb(tmp.dir, "chunktest", 0xCAFEBABE, 3, &names, &pkt_seqs, &lens);
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = try tmp.dir.realpath(".", &path_buf);
+    const full_path = try std.fmt.allocPrint(allocator, "{s}/chunktest", .{dir_path});
+    defer allocator.free(full_path);
+
+    var db = try EaselDsqData.open(allocator, full_path);
+    defer db.deinit();
+
+    // Read chunk of 2 starting at index 1
+    const chunk = try db.readChunk(allocator, &alphabet_mod.amino, 1, 2);
+    defer {
+        for (chunk) |*s| {
+            var seq = s.*;
+            seq.deinit();
+        }
+        allocator.free(chunk);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), chunk.len);
+    try std.testing.expectEqualStrings("s1", chunk[0].name);
+    try std.testing.expectEqualSlices(u8, &[_]u8{1}, chunk[0].dsq);
+    try std.testing.expectEqualStrings("s2", chunk[1].name);
+    try std.testing.expectEqualSlices(u8, &[_]u8{2}, chunk[1].dsq);
+
+    // Read chunk that extends past end
+    const tail = try db.readChunk(allocator, &alphabet_mod.amino, 3, 10);
+    defer {
+        for (tail) |*s| {
+            var seq = s.*;
+            seq.deinit();
+        }
+        allocator.free(tail);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), tail.len);
+    try std.testing.expectEqualStrings("s3", tail[0].name);
+    try std.testing.expectEqualStrings("s4", tail[1].name);
+
+    // Read chunk at out-of-range index returns empty slice
+    const empty = try db.readChunk(allocator, &alphabet_mod.amino, 100, 5);
+    defer allocator.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
 }
