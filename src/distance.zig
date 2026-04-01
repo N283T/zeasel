@@ -131,6 +131,81 @@ pub fn averageIdentity(allocator: Allocator, m: Msa, max_pairs: usize) !f64 {
     }
 }
 
+/// Pairwise match fraction between two aligned sequences in an MSA.
+/// Computes M / (M + D + I) where:
+///   M = both positions are residues (match columns)
+///   D = seq i has residue, seq j has gap (deletion)
+///   I = seq i has gap, seq j has residue (insertion)
+/// Double-gap columns are excluded entirely.
+/// Returns 0.0 if there are no non-double-gap columns.
+pub fn pairMatch(m: Msa, i: usize, j: usize) f64 {
+    var match_count: u32 = 0;
+    var total: u32 = 0;
+    for (0..m.alen) |col| {
+        const a = m.seqs[i][col];
+        const b = m.seqs[j][col];
+        const a_res = m.abc.isResidue(a);
+        const b_res = m.abc.isResidue(b);
+        if (!a_res and !b_res) continue; // double-gap: skip
+        total += 1;
+        if (a_res and b_res) match_count += 1;
+    }
+    if (total == 0) return 0.0;
+    return @as(f64, @floatFromInt(match_count)) / @as(f64, @floatFromInt(total));
+}
+
+/// Average pairwise match fraction across all sequence pairs in an MSA.
+/// For N sequences, computes pairMatch for all N*(N-1)/2 pairs and returns
+/// the mean. Returns 1.0 for single-sequence MSAs by convention.
+pub fn averageMatch(allocator: Allocator, m: Msa) !f64 {
+    _ = allocator;
+    const n = m.nseq();
+    if (n <= 1) return 1.0;
+
+    var sum: f64 = 0.0;
+    for (0..n) |i| {
+        for (i + 1..n) |j| {
+            sum += pairMatch(m, i, j);
+        }
+    }
+    const total_pairs = n * (n - 1) / 2;
+    return sum / @as(f64, @floatFromInt(total_pairs));
+}
+
+/// Result of avgConnectivity computation.
+pub const ConnectivityResult = struct {
+    avg_id: f64,
+    connectivity: f64,
+};
+
+/// Simultaneously compute average pairwise identity and the fraction of
+/// pairs exceeding a given identity threshold (connectivity).
+/// For N sequences, examines all N*(N-1)/2 pairs.
+/// Returns avg_id=1.0 and connectivity=1.0 for single-sequence MSAs.
+pub fn avgConnectivity(allocator: Allocator, m: Msa, threshold: f64) !ConnectivityResult {
+    _ = allocator;
+    const n = m.nseq();
+    if (n <= 1) return .{ .avg_id = 1.0, .connectivity = 1.0 };
+
+    var sum_id: f64 = 0.0;
+    var above: u64 = 0;
+    const total_pairs = n * (n - 1) / 2;
+
+    for (0..n) |i| {
+        for (i + 1..n) |j| {
+            const pid = percentIdentity(m.abc, m.seqs[i], m.seqs[j]);
+            sum_id += pid;
+            if (pid >= threshold) above += 1;
+        }
+    }
+
+    const total_f: f64 = @floatFromInt(total_pairs);
+    return .{
+        .avg_id = sum_id / total_f,
+        .connectivity = @as(f64, @floatFromInt(above)) / total_f,
+    };
+}
+
 // --- Tests ---
 
 test "percentIdentity: identical sequences returns 1.0" {
@@ -301,4 +376,142 @@ test "averageIdentity: 3 seqs exhaustive matches manual calculation" {
     // average = (0.5 + 0.0 + 0.5) / 3 = 1/3
     const avg = try averageIdentity(allocator, msa_data, 10000);
     try std.testing.expectApproxEqAbs(1.0 / 3.0, avg, 1e-10);
+}
+
+test "pairMatch: identical ungapped sequences returns 1.0" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+    const names = [_][]const u8{ "s1", "s2" };
+    const seqs = [_][]const u8{ "ACGT", "ACGT" };
+    var m = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer m.deinit();
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), pairMatch(m, 0, 1), 1e-10);
+}
+
+test "pairMatch: gaps reduce match fraction" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+    // s1: A C G T   (all residues)
+    // s2: A - G -   (gaps at positions 1 and 3)
+    // Non-double-gap columns: all 4
+    //   col 0: both residue -> M
+    //   col 1: A vs gap -> D
+    //   col 2: both residue -> M
+    //   col 3: T vs gap -> D
+    // M=2, D=2, I=0 -> 2/4 = 0.5
+    const names = [_][]const u8{ "s1", "s2" };
+    const seqs = [_][]const u8{ "ACGT", "A-G-" };
+    var m = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer m.deinit();
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), pairMatch(m, 0, 1), 1e-10);
+}
+
+test "pairMatch: double-gaps are excluded" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+    // s1: A - G    s2: A - T
+    // col 0: M, col 1: double-gap (skip), col 2: mismatch but both residue -> M
+    // Wait, M counts both-residue, not both-identical. M = match columns = both residue.
+    // col 0: both res -> M, col 1: both gap -> skip, col 2: both res -> M
+    // M=2, total non-double-gap = 2 -> 2/2 = 1.0
+    // But A vs T at col 2: both are residues -> still counted as M (match = both residue)
+    const names = [_][]const u8{ "s1", "s2" };
+    const seqs = [_][]const u8{ "A-G", "A-T" };
+    var m = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer m.deinit();
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), pairMatch(m, 0, 1), 1e-10);
+}
+
+test "pairMatch: all double-gaps returns 0.0" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+    const names = [_][]const u8{ "s1", "s2" };
+    const seqs = [_][]const u8{ "---", "---" };
+    var m = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer m.deinit();
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), pairMatch(m, 0, 1), 1e-10);
+}
+
+test "pairMatch: asymmetric gaps (insertion vs deletion)" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+    // s1: A - C A   s2: - A C -
+    // col 0: A vs gap -> D (i has res, j has gap)
+    // col 1: gap vs A -> I (i has gap, j has res)
+    // col 2: C vs C -> M
+    // col 3: A vs gap -> D
+    // M=1, D=2, I=1, total=4 -> 1/4 = 0.25
+    const names = [_][]const u8{ "s1", "s2" };
+    const seqs = [_][]const u8{ "A-CA", "-AC-" };
+    var m = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer m.deinit();
+    try std.testing.expectApproxEqAbs(@as(f64, 0.25), pairMatch(m, 0, 1), 1e-10);
+}
+
+test "averageMatch: single sequence returns 1.0" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+    const names = [_][]const u8{"s1"};
+    const seqs = [_][]const u8{"ACGT"};
+    var m = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer m.deinit();
+    const avg = try averageMatch(allocator, m);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), avg, 1e-10);
+}
+
+test "averageMatch: 3 seqs with gaps" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+    // s1: ACGT  s2: A-GT  s3: AC--
+    // s1 vs s2: M=3 (cols 0,2,3), D=1 (col 1), total=4 -> 3/4
+    // s1 vs s3: M=2 (cols 0,1), D=2 (cols 2,3), total=4 -> 2/4=1/2
+    // s2 vs s3: col0: M, col1: gap vs C -> I, col2: G vs gap -> D, col3: T vs gap -> D
+    //           M=1, D=2, I=1, total=4 -> 1/4
+    // average = (3/4 + 1/2 + 1/4) / 3 = (3/4+2/4+1/4)/3 = (6/4)/3 = 1/2
+    const names = [_][]const u8{ "s1", "s2", "s3" };
+    const seqs = [_][]const u8{ "ACGT", "A-GT", "AC--" };
+    var m = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer m.deinit();
+    const avg = try averageMatch(allocator, m);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), avg, 1e-10);
+}
+
+test "avgConnectivity: single sequence" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+    const names = [_][]const u8{"s1"};
+    const seqs = [_][]const u8{"ACGT"};
+    var m = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer m.deinit();
+    const result = try avgConnectivity(allocator, m, 0.5);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), result.avg_id, 1e-10);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), result.connectivity, 1e-10);
+}
+
+test "avgConnectivity: 3 seqs with threshold" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+    const names = [_][]const u8{ "s1", "s2", "s3" };
+    const seqs = [_][]const u8{ "AAAA", "AATT", "TTTT" };
+    var m = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer m.deinit();
+    // s1 vs s2: pid=0.5, s1 vs s3: pid=0.0, s2 vs s3: pid=0.5
+    // avg_id = (0.5 + 0.0 + 0.5) / 3 = 1/3
+    // threshold=0.5: pairs >= 0.5 are s1-s2 and s2-s3 = 2 of 3
+    const result = try avgConnectivity(allocator, m, 0.5);
+    try std.testing.expectApproxEqAbs(1.0 / 3.0, result.avg_id, 1e-10);
+    try std.testing.expectApproxEqAbs(2.0 / 3.0, result.connectivity, 1e-10);
+}
+
+test "avgConnectivity: high threshold gives zero connectivity" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+    const names = [_][]const u8{ "s1", "s2" };
+    const seqs = [_][]const u8{ "AAAA", "TTTT" };
+    var m = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer m.deinit();
+    // pid=0.0, threshold=0.5: no pairs above -> connectivity=0
+    const result = try avgConnectivity(allocator, m, 0.5);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), result.avg_id, 1e-10);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), result.connectivity, 1e-10);
 }

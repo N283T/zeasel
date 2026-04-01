@@ -167,18 +167,58 @@ pub fn blosum(allocator: Allocator, m: Msa, id_threshold: f64) ![]f64 {
 /// Returns a boolean mask where `keep[i] = true` means sequence i is retained.
 /// Sequences are considered in input order; the first sequence is always kept,
 /// and subsequent sequences are removed if they exceed `max_id` identity with
-/// any already-kept sequence. Caller owns the returned slice.
-pub fn idFilter(allocator: Allocator, m: Msa, max_id: f64) ![]bool {
+/// any already-kept sequence.
+///
+/// When `prefer_conscover` is true, the sequence with fewer non-gap residues
+/// in consensus columns (as marked by `msa.reference`) is removed instead of
+/// always removing the later sequence. If no reference annotation is available,
+/// falls back to removing the later sequence (same as prefer_conscover=false).
+///
+/// Caller owns the returned slice.
+pub fn idFilter(allocator: Allocator, m: Msa, max_id: f64, prefer_conscover: bool) ![]bool {
     const n = m.nseq();
     const keep = try allocator.alloc(bool, n);
     @memset(keep, true);
+
+    // Precompute consensus coverage per sequence if needed.
+    const conscover: ?[]u32 = if (prefer_conscover and m.reference != null) blk: {
+        const cc = try allocator.alloc(u32, n);
+        const ref = m.reference.?;
+        for (0..n) |s| {
+            var count: u32 = 0;
+            for (0..m.alen) |col| {
+                if (ref[col] == '.' or ref[col] == '~') continue; // insert column
+                if (m.abc.isResidue(m.seqs[s][col])) count += 1;
+            }
+            cc[s] = count;
+        }
+        break :blk cc;
+    } else null;
+    defer if (conscover) |cc| allocator.free(cc);
 
     for (0..n) |i| {
         if (!keep[i]) continue;
         for (i + 1..n) |j| {
             if (!keep[j]) continue;
             if (pairwiseIdentity(m, i, j) >= max_id) {
-                keep[j] = false;
+                // Decide which to remove.
+                if (conscover) |cc| {
+                    // Remove the one with lower consensus coverage.
+                    if (cc[j] < cc[i]) {
+                        keep[j] = false;
+                    } else if (cc[i] < cc[j]) {
+                        // Swap: remove i, but since i is the outer loop seq
+                        // and we need to stop comparing from i, mark i as removed
+                        // and break out of the inner loop.
+                        keep[i] = false;
+                        break;
+                    } else {
+                        // Tie: remove later sequence (default behavior).
+                        keep[j] = false;
+                    }
+                } else {
+                    keep[j] = false;
+                }
             }
         }
     }
@@ -685,4 +725,74 @@ test "gsc: 3 identical sequences get equal weights" {
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), w[0], 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), w[1], 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), w[2], 1e-9);
+}
+
+test "idFilter: basic filtering removes similar sequences" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+    // s1 and s2 are identical (pid=1.0), s3 is different.
+    const names = [_][]const u8{ "s1", "s2", "s3" };
+    const seqs = [_][]const u8{ "ACGT", "ACGT", "TTTT" };
+    var m = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer m.deinit();
+    const keep = try idFilter(allocator, m, 0.9, false);
+    defer allocator.free(keep);
+    // s1 kept, s2 removed (identical to s1), s3 kept (different)
+    try std.testing.expect(keep[0]);
+    try std.testing.expect(!keep[1]);
+    try std.testing.expect(keep[2]);
+}
+
+test "idFilter: all unique sequences kept" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+    const names = [_][]const u8{ "s1", "s2" };
+    const seqs = [_][]const u8{ "AAAA", "TTTT" };
+    var m = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer m.deinit();
+    const keep = try idFilter(allocator, m, 0.5, false);
+    defer allocator.free(keep);
+    try std.testing.expect(keep[0]);
+    try std.testing.expect(keep[1]);
+}
+
+test "idFilter: conscover prefers sequence with more consensus residues" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+    // s1: AC-T  (3 residues in consensus cols 0,2,3: A,-,T -> 2 consensus residues)
+    // s2: ACGT  (4 residues in consensus cols 0,2,3: A,G,T -> 3 consensus residues)
+    // s3: TTTT  (different enough to keep)
+    // RF: x.xx  (col 1 is insert)
+    // s1 and s2 are similar (pid high). With conscover, s1 should be removed
+    // because s2 has more consensus coverage.
+    const names = [_][]const u8{ "s1", "s2", "s3" };
+    const seqs = [_][]const u8{ "AC-T", "ACGT", "TTTT" };
+    var m = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer m.deinit();
+    m.reference = try m.allocator.dupe(u8, "x.xx");
+
+    // s1 vs s2: A,C,gap,T vs A,C,G,T
+    // len1=3 (A,C,T), len2=4 (A,C,G,T), matches=3 (cols 0,1,3), pid=3/3=1.0
+    // With conscover: s1 has 2 consensus residues (A,T), s2 has 3 (A,G,T)
+    // -> remove s1 (lower coverage)
+    const keep = try idFilter(allocator, m, 0.9, true);
+    defer allocator.free(keep);
+    try std.testing.expect(!keep[0]); // s1 removed (lower conscover)
+    try std.testing.expect(keep[1]); // s2 kept (higher conscover)
+    try std.testing.expect(keep[2]); // s3 kept (different)
+}
+
+test "idFilter: conscover falls back to default without reference" {
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+    const names = [_][]const u8{ "s1", "s2", "s3" };
+    const seqs = [_][]const u8{ "ACGT", "ACGT", "TTTT" };
+    var m = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer m.deinit();
+    // No reference set -> conscover has no effect, later seq removed.
+    const keep = try idFilter(allocator, m, 0.9, true);
+    defer allocator.free(keep);
+    try std.testing.expect(keep[0]);
+    try std.testing.expect(!keep[1]);
+    try std.testing.expect(keep[2]);
 }
