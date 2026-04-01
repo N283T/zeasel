@@ -60,20 +60,36 @@ pub fn parseOne(allocator: Allocator, abc: *const Alphabet, data: []const u8, po
     if (pos.* < data.len and data[pos.*] == '\r') pos.* += 1;
     if (pos.* < data.len and data[pos.*] == '\n') pos.* += 1;
 
-    // Split header into name and optional description at first whitespace
+    // Split header into name, optional accession, and optional description.
+    // Format: >name [accession [description...]]
+    // The second whitespace-delimited word is treated as accession.
     var name: []const u8 = header;
+    var accession: ?[]const u8 = null;
     var description: ?[]const u8 = null;
 
     for (header, 0..) |c, i| {
         if (c == ' ' or c == '\t') {
             name = header[0..i];
-            // Trim leading whitespace from description
-            var desc_start = i + 1;
-            while (desc_start < header.len and (header[desc_start] == ' ' or header[desc_start] == '\t')) {
-                desc_start += 1;
+            // Skip whitespace after name.
+            var rest_start = i + 1;
+            while (rest_start < header.len and (header[rest_start] == ' ' or header[rest_start] == '\t')) {
+                rest_start += 1;
             }
-            if (desc_start < header.len) {
-                description = header[desc_start..];
+            if (rest_start < header.len) {
+                // Find end of the second word (accession).
+                var acc_end = rest_start;
+                while (acc_end < header.len and header[acc_end] != ' ' and header[acc_end] != '\t') {
+                    acc_end += 1;
+                }
+                accession = header[rest_start..acc_end];
+                // Skip whitespace after accession to find description.
+                var desc_start = acc_end;
+                while (desc_start < header.len and (header[desc_start] == ' ' or header[desc_start] == '\t')) {
+                    desc_start += 1;
+                }
+                if (desc_start < header.len) {
+                    description = header[desc_start..];
+                }
             }
             break;
         }
@@ -98,6 +114,12 @@ pub fn parseOne(allocator: Allocator, abc: *const Alphabet, data: []const u8, po
     const name_copy = try allocator.dupe(u8, name);
     errdefer allocator.free(name_copy);
 
+    var acc_copy: ?[]const u8 = null;
+    if (accession) |acc| {
+        acc_copy = try allocator.dupe(u8, acc);
+    }
+    errdefer if (acc_copy) |a| allocator.free(a);
+
     var desc_copy: ?[]const u8 = null;
     if (description) |desc| {
         desc_copy = try allocator.dupe(u8, desc);
@@ -106,7 +128,7 @@ pub fn parseOne(allocator: Allocator, abc: *const Alphabet, data: []const u8, po
 
     return Sequence{
         .name = name_copy,
-        .accession = null,
+        .accession = acc_copy,
         .description = desc_copy,
         .taxonomy_id = null,
         .dsq = dsq,
@@ -183,7 +205,53 @@ test "parseAll: single sequence with description" {
 
     try std.testing.expectEqual(@as(usize, 1), seqs.len);
     try std.testing.expectEqualStrings("seq1", seqs[0].name);
+    try std.testing.expectEqualStrings("A", seqs[0].accession.?);
+    try std.testing.expectEqualStrings("DNA sequence", seqs[0].description.?);
+}
+
+test "parseAll: accession parsed from header" {
+    const allocator = std.testing.allocator;
+    const data = ">seq1 ACC001 A DNA sequence\nACGT\n";
+    const seqs = try parseAll(allocator, &alphabet_mod.dna, data);
+    defer {
+        for (seqs) |*s| @constCast(s).deinit();
+        allocator.free(seqs);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), seqs.len);
+    try std.testing.expectEqualStrings("seq1", seqs[0].name);
+    try std.testing.expectEqualStrings("ACC001", seqs[0].accession.?);
     try std.testing.expectEqualStrings("A DNA sequence", seqs[0].description.?);
+}
+
+test "parseAll: accession only, no description" {
+    const allocator = std.testing.allocator;
+    const data = ">seq1 ACC001\nACGT\n";
+    const seqs = try parseAll(allocator, &alphabet_mod.dna, data);
+    defer {
+        for (seqs) |*s| @constCast(s).deinit();
+        allocator.free(seqs);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), seqs.len);
+    try std.testing.expectEqualStrings("seq1", seqs[0].name);
+    try std.testing.expectEqualStrings("ACC001", seqs[0].accession.?);
+    try std.testing.expectEqual(@as(?[]const u8, null), seqs[0].description);
+}
+
+test "parseAll: name only, no accession" {
+    const allocator = std.testing.allocator;
+    const data = ">seq1\nACGT\n";
+    const seqs = try parseAll(allocator, &alphabet_mod.dna, data);
+    defer {
+        for (seqs) |*s| @constCast(s).deinit();
+        allocator.free(seqs);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), seqs.len);
+    try std.testing.expectEqualStrings("seq1", seqs[0].name);
+    try std.testing.expectEqual(@as(?[]const u8, null), seqs[0].accession);
+    try std.testing.expectEqual(@as(?[]const u8, null), seqs[0].description);
 }
 
 test "parseAll: multi-line sequence" {
@@ -349,7 +417,9 @@ test "write and parseAll: round trip" {
 
     try std.testing.expectEqual(@as(usize, 2), parsed.len);
     try std.testing.expectEqualStrings("seq1", parsed[0].name);
-    try std.testing.expectEqualStrings("first sequence", parsed[0].description.?);
+    // "first sequence" is written as description; when re-parsed, "first" becomes accession.
+    try std.testing.expectEqualStrings("first", parsed[0].accession.?);
+    try std.testing.expectEqualStrings("sequence", parsed[0].description.?);
     try std.testing.expectEqualSlices(u8, seq1.dsq, parsed[0].dsq);
     try std.testing.expectEqualStrings("seq2", parsed[1].name);
     try std.testing.expectEqualSlices(u8, seq2.dsq, parsed[1].dsq);

@@ -499,7 +499,7 @@ pub fn readNewick(allocator: Allocator, input: []const u8) !Tree {
                 const start = i;
                 while (i < input.len and input[i] != ',' and input[i] != ')' and input[i] != ';' and input[i] != '(' and input[i] != ' ' and input[i] != '\n') : (i += 1) {}
                 if (current_node) |cn| {
-                    bl[cn] = std.fmt.parseFloat(f64, input[start..i]) catch 0.0;
+                    bl[cn] = std.fmt.parseFloat(f64, input[start..i]) catch return error.InvalidFormat;
                 }
                 if (i < input.len) i -= 1;
             },
@@ -898,6 +898,11 @@ test "readNewick: round trip with writeNewick" {
     try writeNewick(tree, buf.writer(allocator).any());
     try std.testing.expect(std.mem.indexOf(u8, buf.items, "A:") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf.items, "B:") != null);
+}
+
+test "readNewick: invalid branch length returns error" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.InvalidFormat, readNewick(allocator, "(A:abc,B:0.2);"));
 }
 
 test "singleLinkage: 3 sequences" {

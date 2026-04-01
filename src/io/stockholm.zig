@@ -450,11 +450,14 @@ pub fn parseAll(allocator: Allocator, abc: *const Alphabet, data: []const u8) ![
     return result.toOwnedSlice(allocator);
 }
 
-/// Write an Msa in Stockholm format.
+/// Write an Msa in Stockholm format with interleaved blocks of `cpl` columns.
 /// Writes all markup stored in gf_markup/gc_markup/gs_markup/gr_markup.
 /// If the dedicated name/accession/description fields are set but not covered by
 /// gf_markup, they are written as #=GF ID/AC/DE lines.
+/// Matches Easel's default of 200 columns per line (cpl).
 pub fn write(dest: std.io.AnyWriter, m: Msa) !void {
+    const cpl: usize = 200;
+
     try dest.writeAll("# STOCKHOLM 1.0\n");
 
     const has_gf = m.gf_markup != null and m.gf_markup.?.len > 0;
@@ -493,9 +496,130 @@ pub fn write(dest: std.io.AnyWriter, m: Msa) !void {
         }
     }
 
+    // Compute column width for name/tag padding.
+    var max_name_len: usize = 0;
+    for (m.names) |name| {
+        if (name.len > max_name_len) max_name_len = name.len;
+    }
+    // Account for GR tag labels: "#=GR <name> <tag> " prefix length.
+    var max_gr_prefix: usize = 0;
+    if (m.gr_markup) |entries| {
+        for (entries) |e| {
+            // "#=GR " (5) + seq_name + " " (1) + tag + " " (1)
+            const prefix_len = 5 + e.seq_name.len + 1 + e.tag.len + 1;
+            if (prefix_len > max_gr_prefix) max_gr_prefix = prefix_len;
+        }
+    }
+    // Account for GC tag labels: "#=GC <tag> " prefix length.
+    var max_gc_prefix: usize = 0;
+    if (m.gc_markup) |entries| {
+        for (entries) |e| {
+            // "#=GC " (5) + tag + " " (1)
+            const prefix_len = 5 + e.tag.len + 1;
+            if (prefix_len > max_gc_prefix) max_gc_prefix = prefix_len;
+        }
+    }
+    const col_width = max_name_len + 2;
+
+    // Pre-textize all sequences once to avoid repeated allocation in the block loop.
+    const texts = try m.allocator.alloc([]u8, m.nseq());
+    defer {
+        for (texts) |t| m.allocator.free(t);
+        m.allocator.free(texts);
+    }
+    for (0..m.nseq()) |i| {
+        texts[i] = try m.abc.textize(m.allocator, m.seqs[i]);
+    }
+
+    // Write interleaved blocks.
+    var col: usize = 0;
+    while (col < m.alen) {
+        const end = @min(col + cpl, m.alen);
+
+        try dest.writeByte('\n');
+
+        for (0..m.nseq()) |i| {
+            const name = m.names[i];
+            try dest.writeAll(name);
+            try writePadding(dest, col_width - name.len);
+            try dest.writeAll(texts[i][col..end]);
+            try dest.writeByte('\n');
+
+            // Write #=GR lines for this sequence in this block.
+            if (m.gr_markup) |entries| {
+                for (entries) |e| {
+                    if (std.mem.eql(u8, e.seq_name, name)) {
+                        try dest.print("#=GR {s} {s}", .{ e.seq_name, e.tag });
+                        // Pad to align annotation with sequence data.
+                        const gr_prefix = 5 + e.seq_name.len + 1 + e.tag.len;
+                        if (col_width + max_name_len > gr_prefix) {
+                            // Not applicable in the general case; just use one space.
+                        }
+                        try dest.writeByte(' ');
+                        try dest.writeAll(e.annotation[col..end]);
+                        try dest.writeByte('\n');
+                    }
+                }
+            }
+        }
+
+        // Write #=GC lines for this block.
+        if (m.gc_markup) |entries| {
+            for (entries) |e| {
+                try dest.print("#=GC {s} ", .{e.tag});
+                try dest.writeAll(e.annotation[col..end]);
+                try dest.writeByte('\n');
+            }
+        }
+
+        col = end;
+    }
+
+    try dest.writeAll("//\n");
+}
+
+/// Write an Msa in Pfam format (single-block Stockholm).
+/// Pfam is identical to Stockholm except the entire alignment is guaranteed
+/// to be in a single block (one line per sequence, no interleaving).
+/// This is the format used by Pfam-A.full and Pfam-A.seed files.
+pub fn writePfam(dest: std.io.AnyWriter, m: Msa) !void {
+    try dest.writeAll("# STOCKHOLM 1.0\n");
+
+    const has_gf = m.gf_markup != null and m.gf_markup.?.len > 0;
+
+    if (has_gf) {
+        for (m.gf_markup.?) |e| {
+            try dest.print("#=GF {s}   {s}\n", .{ e.tag, e.value });
+        }
+        if (m.name) |nm| {
+            if (!gfMarkupHasTag(m.gf_markup.?, "ID")) {
+                try dest.print("#=GF ID   {s}\n", .{nm});
+            }
+        }
+        if (m.accession) |acc| {
+            if (!gfMarkupHasTag(m.gf_markup.?, "AC")) {
+                try dest.print("#=GF AC   {s}\n", .{acc});
+            }
+        }
+        if (m.description) |desc| {
+            if (!gfMarkupHasTag(m.gf_markup.?, "DE")) {
+                try dest.print("#=GF DE   {s}\n", .{desc});
+            }
+        }
+    } else {
+        if (m.name) |nm| try dest.print("#=GF ID   {s}\n", .{nm});
+        if (m.accession) |acc| try dest.print("#=GF AC   {s}\n", .{acc});
+        if (m.description) |desc| try dest.print("#=GF DE   {s}\n", .{desc});
+    }
+
+    if (m.gs_markup) |entries| {
+        for (entries) |e| {
+            try dest.print("#=GS {s} {s} {s}\n", .{ e.seq_name, e.tag, e.value });
+        }
+    }
+
     try dest.writeByte('\n');
 
-    // Compute column width for name padding.
     var max_name_len: usize = 0;
     for (m.names) |name| {
         if (name.len > max_name_len) max_name_len = name.len;
@@ -512,7 +636,6 @@ pub fn write(dest: std.io.AnyWriter, m: Msa) !void {
         try dest.writeAll(text);
         try dest.writeByte('\n');
 
-        // Write #=GR lines for this sequence immediately after it.
         if (m.gr_markup) |entries| {
             for (entries) |e| {
                 if (std.mem.eql(u8, e.seq_name, name)) {
@@ -522,7 +645,6 @@ pub fn write(dest: std.io.AnyWriter, m: Msa) !void {
         }
     }
 
-    // Write #=GC lines after all sequences.
     if (m.gc_markup) |entries| {
         for (entries) |e| {
             try dest.print("#=GC {s} {s}\n", .{ e.tag, e.annotation });
@@ -530,16 +652,6 @@ pub fn write(dest: std.io.AnyWriter, m: Msa) !void {
     }
 
     try dest.writeAll("//\n");
-}
-
-/// Write an Msa in Pfam format (single-block Stockholm).
-/// Pfam is identical to Stockholm except the entire alignment is guaranteed
-/// to be in a single block (one line per sequence, no interleaving).
-/// This is the format used by Pfam-A.full and Pfam-A.seed files.
-pub fn writePfam(dest: std.io.AnyWriter, m: Msa) !void {
-    // Pfam is structurally identical to Stockholm in single-block layout,
-    // and our write() already produces single-block output.
-    try write(dest, m);
 }
 
 // --- Helpers ---
@@ -898,6 +1010,105 @@ test "write: GS, GR, and GC markup written" {
     try testing.expect(std.mem.indexOf(u8, buf.items, "#=GS seq1 DE Human") != null);
     try testing.expect(std.mem.indexOf(u8, buf.items, "#=GR seq1 SS ....") != null);
     try testing.expect(std.mem.indexOf(u8, buf.items, "#=GC SS_cons ....") != null);
+}
+
+test "write: interleaves at 200 columns" {
+    const allocator = testing.allocator;
+    const abc = &alphabet_mod.dna;
+
+    // Build a sequence of 300 A's (exceeds 200 cpl).
+    var long_seq: [300]u8 = undefined;
+    @memset(&long_seq, 'A');
+
+    const names = [_][]const u8{ "seq1", "seq2" };
+    const seqs = [_][]const u8{ &long_seq, &long_seq };
+
+    var msa = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer msa.deinit();
+
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(allocator);
+
+    try write(buf.writer(allocator).any(), msa);
+
+    // The output should contain two blocks separated by a blank line.
+    // Count blank lines between sequence blocks (after the header).
+    var blank_count: usize = 0;
+    var output_lines = std.mem.splitScalar(u8, buf.items, '\n');
+    var prev_was_blank = false;
+    while (output_lines.next()) |line| {
+        const trimmed = std.mem.trimRight(u8, line, "\r");
+        if (trimmed.len == 0) {
+            if (!prev_was_blank) blank_count += 1;
+            prev_was_blank = true;
+        } else {
+            prev_was_blank = false;
+        }
+    }
+    // Should have at least 2 blank separators (one per block), indicating interleaving.
+    try testing.expect(blank_count >= 2);
+
+    // Round-trip: parse back and verify data integrity.
+    var restored = try parse(allocator, abc, buf.items);
+    defer restored.deinit();
+
+    try testing.expectEqual(@as(usize, 2), restored.nseq());
+    try testing.expectEqual(@as(usize, 300), restored.alen);
+    try testing.expectEqualSlices(u8, msa.seqs[0], restored.seqs[0]);
+    try testing.expectEqualSlices(u8, msa.seqs[1], restored.seqs[1]);
+}
+
+test "write: interleaved with GR and GC markup" {
+    const allocator = testing.allocator;
+    const abc = &alphabet_mod.dna;
+
+    // Build a 250-column alignment (requires 2 blocks at cpl=200).
+    var long_seq: [250]u8 = undefined;
+    @memset(&long_seq, 'A');
+    var long_annot: [250]u8 = undefined;
+    @memset(&long_annot, '.');
+
+    const names = [_][]const u8{"seq1"};
+    const seqs = [_][]const u8{&long_seq};
+
+    var msa = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer msa.deinit();
+
+    const gr = try allocator.alloc(GrEntry, 1);
+    gr[0] = .{
+        .seq_name = try allocator.dupe(u8, "seq1"),
+        .tag = try allocator.dupe(u8, "SS"),
+        .annotation = try allocator.dupe(u8, &long_annot),
+    };
+    msa.gr_markup = gr;
+
+    const gc = try allocator.alloc(GcEntry, 1);
+    gc[0] = .{
+        .tag = try allocator.dupe(u8, "SS_cons"),
+        .annotation = try allocator.dupe(u8, &long_annot),
+    };
+    msa.gc_markup = gc;
+
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(allocator);
+
+    try write(buf.writer(allocator).any(), msa);
+
+    // Round-trip verification.
+    var restored = try parse(allocator, abc, buf.items);
+    defer restored.deinit();
+
+    try testing.expectEqual(@as(usize, 1), restored.nseq());
+    try testing.expectEqual(@as(usize, 250), restored.alen);
+    try testing.expectEqualSlices(u8, msa.seqs[0], restored.seqs[0]);
+
+    // GR annotation should be fully preserved.
+    try testing.expect(restored.gr_markup != null);
+    try testing.expectEqualStrings(&long_annot, restored.gr_markup.?[0].annotation);
+
+    // GC annotation should be fully preserved.
+    try testing.expect(restored.gc_markup != null);
+    try testing.expectEqualStrings(&long_annot, restored.gc_markup.?[0].annotation);
 }
 
 test "round-trip: write then parse" {

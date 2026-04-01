@@ -141,6 +141,7 @@ pub const LinearRegressionResult = struct {
     sigma_b: f64, // std error of b
     cov_ab: f64, // covariance of a and b
     cc: f64, // Pearson correlation coefficient
+    q: ?f64, // chi-squared goodness-of-fit P-value (only when sigma is provided)
 };
 
 /// Fit n points (x,y) to a straight line y = a + bx by linear regression.
@@ -219,6 +220,17 @@ pub fn linearRegression(x: []const f64, y: []const f64, sigma: ?[]const f64) !Li
     }
     const cc = if (sxx > 0 and syy > 0) sxy / @sqrt(sxx * syy) else 0;
 
+    // Chi-squared goodness-of-fit P-value (only meaningful with per-point sigma)
+    const q_val: ?f64 = if (sigma) |s| blk: {
+        var chi2: f64 = 0;
+        for (0..n) |i| {
+            const residual = y[i] - a_val - b_val * x[i];
+            chi2 += (residual * residual) / (s[i] * s[i]);
+        }
+        const df: f64 = @floatFromInt(n - 2);
+        break :blk 1.0 - gamma_mod.incompleteGamma(df / 2.0, chi2 / 2.0);
+    } else null;
+
     return LinearRegressionResult{
         .a = a_val,
         .b = b_val,
@@ -226,6 +238,7 @@ pub fn linearRegression(x: []const f64, y: []const f64, sigma: ?[]const f64) !Li
         .sigma_b = sb,
         .cov_ab = cov,
         .cc = cc,
+        .q = q_val,
     };
 }
 
@@ -305,6 +318,21 @@ test "linearRegression: perfect line y = 2x + 1" {
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), result.a, 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 2.0), result.b, 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), result.cc, 1e-9);
+    // q is null when sigma is not provided
+    try std.testing.expect(result.q == null);
+}
+
+test "linearRegression: chi-squared Q-value with sigma" {
+    const x = [_]f64{ 1, 2, 3, 4, 5 };
+    const y = [_]f64{ 3.1, 4.9, 7.2, 8.8, 11.1 };
+    const sigma = [_]f64{ 0.5, 0.5, 0.5, 0.5, 0.5 };
+
+    const result = try linearRegression(&x, &y, &sigma);
+    // q should be present when sigma is provided
+    try std.testing.expect(result.q != null);
+    // For data close to a perfect line with reasonable sigma, q should be large (good fit)
+    try std.testing.expect(result.q.? > 0.01);
+    try std.testing.expect(result.q.? <= 1.0);
 }
 
 test "linearRegression: too few points" {

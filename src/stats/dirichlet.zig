@@ -104,8 +104,13 @@ pub const MixtureDirichlet = struct {
         defer allocator.free(log_weights);
 
         for (0..self.q) |qi| {
-            log_weights[qi] = @log(self.mixture_coeffs[qi]) +
-                logDataLikelihood(counts, self.alphas[qi]);
+            // Guard: when mixture weight is zero, use -inf explicitly
+            // instead of relying on @log(0) behavior.
+            const log_coeff: f64 = if (self.mixture_coeffs[qi] == 0)
+                -math.inf(f64)
+            else
+                @log(self.mixture_coeffs[qi]);
+            log_weights[qi] = log_coeff + logDataLikelihood(counts, self.alphas[qi]);
         }
 
         // Step 2: normalise via log-sum-exp.
@@ -122,7 +127,16 @@ pub const MixtureDirichlet = struct {
             weights[qi] = @exp(log_weights[qi] - max_lw);
             total_w += weights[qi];
         }
-        for (weights) |*w| w.* /= total_w;
+
+        // Guard against all-zero weights producing NaN from 0/0.
+        // total_w can be NaN when all log_weights are -inf (all-zero mixture coeffs).
+        if (total_w == 0 or math.isNan(total_w) or math.isInf(total_w)) {
+            // Fall back to uniform weighting over all components.
+            const uniform_w: f64 = 1.0 / @as(f64, @floatFromInt(self.q));
+            @memset(weights, uniform_w);
+        } else {
+            for (weights) |*w| w.* /= total_w;
+        }
 
         // Step 3: weighted average of component posterior means.
         const result = try allocator.alloc(f64, self.k);
@@ -443,6 +457,68 @@ test "sampleUniform: output sums to 1 with k components" {
         try std.testing.expect(v >= 0.0);
         total += v;
     }
+    try std.testing.expect(math.approxEqAbs(f64, total, 1.0, 1e-10));
+}
+
+test "MixtureDirichlet posteriorMean: zero-weight component excluded" {
+    const allocator = std.testing.allocator;
+
+    const alpha0 = [_]f64{ 10, 1, 1, 1 };
+    const alpha1 = [_]f64{ 1, 1, 1, 10 };
+    const alphas = [_][]const f64{ &alpha0, &alpha1 };
+    // Component 1 has zero weight -- should not produce NaN.
+    const coeffs = [_]f64{ 1.0, 0.0 };
+
+    const mix = MixtureDirichlet{
+        .q = 2,
+        .mixture_coeffs = &coeffs,
+        .alphas = &alphas,
+        .k = 4,
+    };
+
+    const counts = [_]f64{ 5, 1, 1, 1 };
+    const result = try mix.posteriorMean(allocator, &counts);
+    defer allocator.free(result);
+
+    // Verify no NaN values.
+    for (result) |v| {
+        try std.testing.expect(!math.isNan(v));
+        try std.testing.expect(v >= 0.0);
+    }
+    // Result should sum to 1.
+    var total: f64 = 0;
+    for (result) |v| total += v;
+    try std.testing.expect(math.approxEqAbs(f64, total, 1.0, 1e-10));
+    // With only component 0 active (alpha [10,1,1,1]), result[0] should dominate.
+    try std.testing.expect(result[0] > result[1]);
+}
+
+test "MixtureDirichlet posteriorMean: all-zero weights fallback" {
+    const allocator = std.testing.allocator;
+
+    const alpha0 = [_]f64{ 1, 1, 1, 1 };
+    const alpha1 = [_]f64{ 1, 1, 1, 1 };
+    const alphas = [_][]const f64{ &alpha0, &alpha1 };
+    const coeffs = [_]f64{ 0.0, 0.0 };
+
+    const mix = MixtureDirichlet{
+        .q = 2,
+        .mixture_coeffs = &coeffs,
+        .alphas = &alphas,
+        .k = 4,
+    };
+
+    const counts = [_]f64{ 1, 1, 1, 1 };
+    const result = try mix.posteriorMean(allocator, &counts);
+    defer allocator.free(result);
+
+    // Should not produce NaN despite all-zero weights.
+    for (result) |v| {
+        try std.testing.expect(!math.isNan(v));
+        try std.testing.expect(v >= 0.0);
+    }
+    var total: f64 = 0;
+    for (result) |v| total += v;
     try std.testing.expect(math.approxEqAbs(f64, total, 1.0, 1e-10));
 }
 

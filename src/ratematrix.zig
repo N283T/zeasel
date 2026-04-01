@@ -55,6 +55,24 @@ pub fn normalize(q: *Matrix, pi: []const f64) !void {
     }
 }
 
+/// Scale a rate matrix Q so that the expected number of substitutions
+/// per unit time equals `unit`. For example, unit=1.0 gives substitutions
+/// per site; unit=0.01 gives PAM units (1 substitution per 100 sites).
+/// Equivalent to Easel's `esl_rmx_ScaleTo()`.
+/// Replaces Q's data with the scaled version.
+pub fn scaleTo(q: *Matrix, pi: []const f64, unit: f64) !void {
+    const n = q.rows;
+    var rate: f64 = 0;
+    for (0..n) |i| {
+        rate -= pi[i] * q.get(i, i);
+    }
+    if (rate > 0) {
+        const scaled = try q.scale(unit / rate);
+        q.allocator.free(q.data);
+        q.data = scaled.data;
+    }
+}
+
 /// Compute the probability matrix P(t) = exp(tQ).
 /// Caller owns the returned Matrix.
 pub fn probMatrix(q: Matrix, t: f64) !Matrix {
@@ -393,6 +411,26 @@ test "normalize: expected rate becomes 1" {
     var rate: f64 = 0;
     for (0..2) |i| rate -= pi[i] * q.get(i, i);
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), rate, 1e-10);
+}
+
+test "scaleTo: PAM unit scaling" {
+    const allocator = std.testing.allocator;
+    var s = try Matrix.init(allocator, 2, 2);
+    defer s.deinit();
+    s.set(0, 1, 2.0);
+    s.set(1, 0, 2.0);
+
+    const pi = [_]f64{ 0.5, 0.5 };
+    var q = try fromExchangeability(allocator, s, &pi);
+    defer q.deinit();
+
+    // Scale to PAM units (0.01 substitutions/site per unit time)
+    try scaleTo(&q, &pi, 0.01);
+
+    // Check: -sum(pi[i] * Q[i][i]) should be 0.01
+    var rate: f64 = 0;
+    for (0..2) |i| rate -= pi[i] * q.get(i, i);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.01), rate, 1e-10);
 }
 
 test "probMatrix: P(0) = I" {

@@ -117,20 +117,25 @@ pub const ScoreMatrix = struct {
         for (bg) |p| bg_sum += p;
         if (@abs(bg_sum - 1.0) > 1e-6) return error.InvalidProbabilities;
 
-        // First compute the normalizing constant Z = sum_ij f_i * f_j * exp(lambda * s_ij)
+        // Compute the normalizing constant Z = sum_ij f_i * f_j * exp(lambda * s_ij).
+        // If Z deviates from 1.0 by more than the tolerance, the lambda/background
+        // combination is inconsistent and we return an error rather than silently
+        // normalizing (matching Easel's validation behavior).
         var z: f64 = 0;
         for (0..20) |i| {
             for (0..20) |j| {
                 z += bg[i] * bg[j] * @exp(lambda * @as(f64, @floatFromInt(self.data[i][j])));
             }
         }
+        if (@abs(z - 1.0) > 0.05) return error.InvalidNormalization;
+
         var h: f64 = 0;
         for (0..20) |i| {
             for (0..20) |j| {
                 const s: f64 = @floatFromInt(self.data[i][j]);
-                const p_ij = bg[i] * bg[j] * @exp(lambda * s) / z;
+                const p_ij = bg[i] * bg[j] * @exp(lambda * s);
                 if (p_ij > 0) {
-                    h += p_ij * (lambda * s * math.log2e - @log2(z));
+                    h += p_ij * lambda * s * math.log2e;
                 }
             }
         }
@@ -855,6 +860,11 @@ test "relativeEntropy: invalid probabilities" {
     var bad_bg: [20]f64 = undefined;
     for (&bad_bg) |*v| v.* = 0.1; // sums to 2.0
     try std.testing.expectError(error.InvalidProbabilities, blosum62.relativeEntropy(&bad_bg, 0.3466));
+}
+
+test "relativeEntropy: invalid normalization with wrong lambda" {
+    // A very wrong lambda should cause Z to deviate far from 1.0
+    try std.testing.expectError(error.InvalidNormalization, blosum62.relativeEntropy(&composition.bl62, 5.0));
 }
 
 // ---------------------------------------------------------------------------

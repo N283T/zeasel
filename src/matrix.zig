@@ -105,8 +105,9 @@ pub const Matrix = struct {
         return s;
     }
 
-    /// Minimum element value.
+    /// Minimum element value. Returns 0.0 for empty (0x0) matrices.
     pub fn min(self: Matrix) f64 {
+        if (self.data.len == 0) return 0.0;
         var m: f64 = self.data[0];
         for (self.data[1..]) |v| {
             if (v < m) m = v;
@@ -114,8 +115,9 @@ pub const Matrix = struct {
         return m;
     }
 
-    /// Maximum element value.
+    /// Maximum element value. Returns 0.0 for empty (0x0) matrices.
     pub fn max(self: Matrix) f64 {
+        if (self.data.len == 0) return 0.0;
         var m: f64 = self.data[0];
         for (self.data[1..]) |v| {
             if (v > m) m = v;
@@ -757,6 +759,14 @@ test "Matrix.min and max" {
     m.set(1, 1, 7.0);
     try std.testing.expectApproxEqAbs(@as(f64, -5.0), m.min(), 1e-10);
     try std.testing.expectApproxEqAbs(@as(f64, 7.0), m.max(), 1e-10);
+}
+
+test "Matrix.min and max: empty matrix returns 0" {
+    const allocator = std.testing.allocator;
+    var m = try Matrix.init(allocator, 0, 0);
+    defer m.deinit();
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), m.min(), 1e-10);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), m.max(), 1e-10);
 }
 
 test "Matrix.frobeniusNorm: identity" {

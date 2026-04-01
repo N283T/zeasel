@@ -17,12 +17,15 @@ const Msa = @import("../msa.zig").Msa;
 pub fn parse(allocator: Allocator, abc: *const Alphabet, data: []const u8) !Msa {
     var lines = std.mem.splitScalar(u8, data, '\n');
 
-    // First non-blank line must start with "CLUSTAL".
+    // First non-blank line must start with "CLUSTAL" and contain "alignment" (case-insensitive).
     var found_header = false;
     while (lines.next()) |line| {
         const trimmed = std.mem.trimRight(u8, line, "\r");
         if (trimmed.len == 0) continue;
         if (!std.mem.startsWith(u8, trimmed, "CLUSTAL")) return error.InvalidFormat;
+        // Validate that the rest of the header line contains "alignment" (case-insensitive).
+        const rest = trimmed["CLUSTAL".len..];
+        if (!containsCaseInsensitive(rest, "alignment")) return error.InvalidFormat;
         found_header = true;
         break;
     }
@@ -161,6 +164,26 @@ pub fn write(dest: std.io.AnyWriter, m: Msa) !void {
     }
 }
 
+/// Check if haystack contains needle, case-insensitive.
+fn containsCaseInsensitive(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (haystack.len < needle.len) return false;
+    const limit = haystack.len - needle.len + 1;
+    for (0..limit) |i| {
+        var match = true;
+        for (0..needle.len) |j| {
+            const h = std.ascii.toLower(haystack[i + j]);
+            const n = std.ascii.toLower(needle[j]);
+            if (h != n) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
 // --- Tests ---
 
 const alphabet_mod = @import("../alphabet.zig");
@@ -234,6 +257,46 @@ test "parse: missing CLUSTAL header returns error" {
         error.InvalidFormat,
         parse(allocator, &alphabet_mod.amino, "seq1  ACDE\n"),
     );
+}
+
+test "parse: CLUSTAL header without 'alignment' keyword returns error" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(
+        error.InvalidFormat,
+        parse(allocator, &alphabet_mod.amino, "CLUSTAL W (1.83)\n\nseq1  ACDE\n"),
+    );
+}
+
+test "parse: CLUSTAL header with uppercase ALIGNMENT accepted" {
+    const allocator = std.testing.allocator;
+    const data =
+        \\CLUSTAL W (1.83) multiple sequence ALIGNMENT
+        \\
+        \\seq1      ACDE
+        \\seq2      ACDE
+        \\
+    ;
+
+    var msa = try parse(allocator, &alphabet_mod.amino, data);
+    defer msa.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), msa.nseq());
+}
+
+test "parse: CLUSTAL O header with 'alignment' accepted" {
+    const allocator = std.testing.allocator;
+    const data =
+        \\CLUSTAL O(1.2.4) multiple sequence alignment
+        \\
+        \\seq1      ACDE
+        \\seq2      ACDE
+        \\
+    ;
+
+    var msa = try parse(allocator, &alphabet_mod.amino, data);
+    defer msa.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), msa.nseq());
 }
 
 test "write: basic output" {
