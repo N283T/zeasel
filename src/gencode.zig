@@ -92,16 +92,54 @@ pub const GeneticCode = struct {
     }
 
     /// Return true if the codon formed by the three DNA digital codes is a
-    /// start codon.  Degenerate/gap bases always return false.
+    /// start codon.  For degenerate bases, returns true only if ALL
+    /// possible expansions are start codons (matching Easel's esl_gencode_IsInitiator).
     pub fn isStart(self: GeneticCode, c1: u8, c2: u8, c3: u8) bool {
-        if (c1 >= 4 or c2 >= 4 or c3 >= 4) return false;
+        if (c1 >= 4 or c2 >= 4 or c3 >= 4) return self.isStartAmbiguous(c1, c2, c3);
         const idx = @as(usize, c1) * 16 + @as(usize, c2) * 4 + @as(usize, c3);
         return self.is_start[idx];
     }
 
+    /// Check if a degenerate codon is a start codon by expanding all possible
+    /// unambiguous codons and verifying they are all initiators.
+    fn isStartAmbiguous(self: GeneticCode, c1: u8, c2: u8, c3: u8) bool {
+        const dna_abc = &@import("alphabet.zig").dna;
+        if (c1 >= dna_abc.kp or c2 >= dna_abc.kp or c3 >= dna_abc.kp) return false;
+
+        const mask1 = dna_abc.degen[c1];
+        const mask2 = dna_abc.degen[c2];
+        const mask3 = dna_abc.degen[c3];
+        if (mask1 == 0 or mask2 == 0 or mask3 == 0) return false;
+
+        var b1: u2 = 0;
+        while (true) : (b1 += 1) {
+            if (mask1 & (@as(u32, 1) << b1) != 0) {
+                var b2: u2 = 0;
+                while (true) : (b2 += 1) {
+                    if (mask2 & (@as(u32, 1) << b2) != 0) {
+                        var b3: u2 = 0;
+                        while (true) : (b3 += 1) {
+                            if (mask3 & (@as(u32, 1) << b3) != 0) {
+                                const idx = @as(usize, b1) * 16 + @as(usize, b2) * 4 + @as(usize, b3);
+                                if (!self.is_start[idx]) return false;
+                            }
+                            if (b3 == 3) break;
+                        }
+                    }
+                    if (b2 == 3) break;
+                }
+            }
+            if (b1 == 3) break;
+        }
+        return true;
+    }
+
     /// Translate a DNA digital sequence to a protein digital sequence.
-    /// Reads in frame starting at offset 0.  Translation stops at the first
-    /// stop codon or when fewer than 3 bases remain.
+    /// Reads in frame starting at offset 0.  Degenerate bases are resolved
+    /// via translateAmbiguous; unresolvable codons become the unknown amino
+    /// acid (X). Stop codons are included as STOP_CODON markers (the caller
+    /// decides how to handle them). Translation continues until fewer than
+    /// 3 bases remain.
     ///
     /// The caller owns the returned slice and must free it with the same
     /// allocator.
@@ -110,20 +148,19 @@ pub const GeneticCode = struct {
         allocator: Allocator,
         dna_dsq: []const u8,
     ) ![]u8 {
+        const abc = &@import("alphabet.zig").dna;
         const n_codons = dna_dsq.len / 3;
         var result: std.ArrayList(u8) = .empty;
         errdefer result.deinit(allocator);
         for (0..n_codons) |i| {
-            const aa = self.translate(
-                dna_dsq[i * 3],
-                dna_dsq[i * 3 + 1],
-                dna_dsq[i * 3 + 2],
-            );
-            if (aa) |a| {
-                try result.append(allocator, a);
-            } else {
-                break; // stop codon or degenerate base
-            }
+            const c1 = dna_dsq[i * 3];
+            const c2 = dna_dsq[i * 3 + 1];
+            const c3 = dna_dsq[i * 3 + 2];
+            // Try canonical translation first, then ambiguous resolution
+            const aa = self.translate(c1, c2, c3) orelse
+                self.translateAmbiguous(abc, c1, c2, c3) orelse
+                @import("alphabet.zig").amino.unknownCode(); // X for unresolvable
+            try result.append(allocator, aa);
         }
         return result.toOwnedSlice(allocator);
     }
@@ -462,11 +499,39 @@ fn scanStrandOrfs(
             const c2 = dsq[pos + 1];
             const c3 = dsq[pos + 2];
 
-            // Check for degenerate bases
+            // Handle degenerate bases: try to resolve via ambiguity expansion.
             if (c1 >= 4 or c2 >= 4 or c3 >= 4) {
-                // Treat as non-translatable; if in ORF, add unknown marker and continue
-                if (seen_start) {
-                    try protein_buf.append(allocator, STOP_CODON);
+                const dna_abc = &@import("alphabet.zig").dna;
+                const resolved = gc.translateAmbiguous(dna_abc, c1, c2, c3);
+                if (resolved) |aa_r| {
+                    if (aa_r == STOP_CODON) {
+                        // Resolved to stop — end current ORF
+                        if (seen_start and protein_buf.items.len >= min_length) {
+                            const protein = try protein_buf.toOwnedSlice(allocator);
+                            errdefer allocator.free(protein);
+                            try orfs.append(allocator, .{
+                                .start = orf_start,
+                                .end = pos + 3,
+                                .frame = frame,
+                                .strand = strand,
+                                .protein = protein,
+                            });
+                        } else {
+                            protein_buf.clearRetainingCapacity();
+                        }
+                        seen_start = false;
+                        pos += 3;
+                        continue;
+                    }
+                    // Resolved to an amino acid
+                    if (seen_start) {
+                        try protein_buf.append(allocator, aa_r);
+                    }
+                } else {
+                    // Unresolvable — use X (unknown amino acid) if in ORF
+                    if (seen_start) {
+                        try protein_buf.append(allocator, @import("alphabet.zig").amino.unknownCode());
+                    }
                 }
                 pos += 3;
                 continue;
@@ -649,15 +714,15 @@ test "translateSeq ATGGCTTAT -> [M, A, Y]" {
     try std.testing.expectEqualSlices(u8, &[_]u8{ 10, 0, 19 }, protein);
 }
 
-test "translateSeq stops at stop codon ATGTAAATG -> [M]" {
-    // ATG=M(10), TAA=stop, ATG=M(10)  -- should stop after first M
+test "translateSeq includes stop codon ATGTAAATG -> [M, STOP, M]" {
+    // ATG=M(10), TAA=stop(255), ATG=M(10) — stop codons are now included
     // Digital: A=0,T=3,G=2, T=3,A=0,A=0, A=0,T=3,G=2
     const dna_dsq = [_]u8{ 0, 3, 2, 3, 0, 0, 0, 3, 2 };
     const allocator = std.testing.allocator;
     const protein = try standard.translateSeq(allocator, &dna_dsq);
     defer allocator.free(protein);
 
-    try std.testing.expectEqualSlices(u8, &[_]u8{10}, protein);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 10, STOP_CODON, 10 }, protein);
 }
 
 test "translateSeq empty input -> empty output" {

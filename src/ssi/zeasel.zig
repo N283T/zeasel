@@ -19,7 +19,7 @@ const ssi = @import("../ssi.zig");
 const SsiEntry = ssi.SsiEntry;
 
 const MAGIC = "ZSSI";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2; // v2 adds file_id, aliases, file_names
 
 pub const ZeaselIndex = struct {
     entries: []SsiEntry,
@@ -167,22 +167,42 @@ pub const ZeaselIndex = struct {
     }
 
     /// Write the index to a binary stream (little-endian).
+    /// v2 format: entries with file_id, file_names, alias_map.
     pub fn write(self: ZeaselIndex, dest: std.io.AnyWriter) !void {
-        // Magic + version + num_entries
+        // Header: magic + version + num_entries + num_files + num_aliases
         try dest.writeAll(MAGIC);
         try dest.writeInt(u32, VERSION, .little);
         try dest.writeInt(u64, @intCast(self.entries.len), .little);
+        try dest.writeInt(u32, @intCast(self.file_names.len), .little);
+        try dest.writeInt(u32, @intCast(self.alias_map.count()), .little);
 
+        // Entries (with file_id)
         for (self.entries) |e| {
             try dest.writeInt(u32, @intCast(e.name.len), .little);
             try dest.writeAll(e.name);
             try dest.writeInt(u64, e.offset, .little);
             try dest.writeInt(u64, e.data_offset, .little);
             try dest.writeInt(u64, e.seq_len, .little);
+            try dest.writeInt(u16, e.file_id, .little);
+        }
+
+        // File names
+        for (self.file_names) |fname| {
+            try dest.writeInt(u32, @intCast(fname.len), .little);
+            try dest.writeAll(fname);
+        }
+
+        // Aliases: each is (alias_name_len, alias_name, entry_index)
+        var alias_it = self.alias_map.iterator();
+        while (alias_it.next()) |kv| {
+            try dest.writeInt(u32, @intCast(kv.key_ptr.len), .little);
+            try dest.writeAll(kv.key_ptr.*);
+            try dest.writeInt(u64, @intCast(kv.value_ptr.*), .little);
         }
     }
 
     /// Read an index from a binary stream.
+    /// Supports both v1 (no file_id/aliases/file_names) and v2 formats.
     /// Caller owns the returned ZeaselIndex and must call deinit().
     pub fn read(allocator: Allocator, src: std.io.AnyReader) !ZeaselIndex {
         var magic: [4]u8 = undefined;
@@ -190,9 +210,13 @@ pub const ZeaselIndex = struct {
         if (!std.mem.eql(u8, &magic, MAGIC)) return error.InvalidFormat;
 
         const version = try src.readInt(u32, .little);
-        if (version != VERSION) return error.UnsupportedVersion;
+        if (version != 1 and version != VERSION) return error.UnsupportedVersion;
 
         const num_entries = try src.readInt(u64, .little);
+
+        // v2 has additional header fields
+        const num_files: u32 = if (version >= 2) try src.readInt(u32, .little) else 0;
+        const num_aliases: u32 = if (version >= 2) try src.readInt(u32, .little) else 0;
 
         const entries = try allocator.alloc(SsiEntry, num_entries);
         var entries_done: usize = 0;
@@ -210,28 +234,64 @@ pub const ZeaselIndex = struct {
             const offset = try src.readInt(u64, .little);
             const data_offset = try src.readInt(u64, .little);
             const seq_len = try src.readInt(u64, .little);
+            const file_id: u16 = if (version >= 2) try src.readInt(u16, .little) else 0;
 
             entries[i] = SsiEntry{
                 .name = name,
                 .offset = offset,
                 .data_offset = data_offset,
                 .seq_len = seq_len,
+                .file_id = file_id,
             };
             entries_done += 1;
         }
 
+        // Read file names
+        var file_names: [][]const u8 = &.{};
+        if (num_files > 0) {
+            file_names = try allocator.alloc([]const u8, num_files);
+            var files_done: usize = 0;
+            errdefer {
+                for (0..files_done) |fi| allocator.free(file_names[fi]);
+                allocator.free(file_names);
+            }
+            for (0..num_files) |fi| {
+                const fname_len = try src.readInt(u32, .little);
+                const fname = try allocator.alloc(u8, fname_len);
+                errdefer allocator.free(fname);
+                _ = try src.readAll(fname);
+                file_names[fi] = fname;
+                files_done += 1;
+            }
+        }
+
         var name_map = std.StringHashMap(usize).init(allocator);
         errdefer name_map.deinit();
-
         for (entries, 0..) |e, i| {
             try name_map.put(e.name, i);
+        }
+
+        // Read aliases
+        var alias_map = std.StringHashMap(usize).init(allocator);
+        errdefer {
+            var ait = alias_map.keyIterator();
+            while (ait.next()) |k| allocator.free(k.*);
+            alias_map.deinit();
+        }
+        for (0..num_aliases) |_| {
+            const alias_len = try src.readInt(u32, .little);
+            const alias_name = try allocator.alloc(u8, alias_len);
+            errdefer allocator.free(alias_name);
+            _ = try src.readAll(alias_name);
+            const entry_idx = try src.readInt(u64, .little);
+            try alias_map.put(alias_name, entry_idx);
         }
 
         return ZeaselIndex{
             .entries = entries,
             .name_map = name_map,
-            .alias_map = std.StringHashMap(usize).init(allocator),
-            .file_names = &.{},
+            .alias_map = alias_map,
+            .file_names = file_names,
             .allocator = allocator,
         };
     }

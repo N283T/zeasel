@@ -325,6 +325,29 @@ pub fn parse(allocator: Allocator, abc: *const Alphabet, data: []const u8) !Msa 
     }
     gc_list.deinit(allocator);
 
+    // Extract per-sequence weights from GS WT entries.
+    for (gs_list.items) |gs| {
+        if (std.mem.eql(u8, gs.tag, "WT")) {
+            // Find the sequence index for this name.
+            for (names_slice, 0..) |nm, si| {
+                if (std.mem.eql(u8, nm, gs.seq_name)) {
+                    // Parse the weight value.
+                    const trimmed_val = std.mem.trim(u8, gs.value, " \t");
+                    if (std.fmt.parseFloat(f64, trimmed_val)) |wt| {
+                        // Allocate weights array on first use.
+                        if (msa.weights == null) {
+                            const w = try allocator.alloc(f64, msa.nseq());
+                            @memset(w, 1.0);
+                            msa.weights = w;
+                        }
+                        msa.weights.?[si] = wt;
+                    } else |_| {}
+                    break;
+                }
+            }
+        }
+    }
+
     // Transfer gs_markup.
     if (gs_list.items.len > 0) {
         msa.gs_markup = try gs_list.toOwnedSlice(allocator);

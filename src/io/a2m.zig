@@ -18,7 +18,10 @@ const Alphabet = @import("../alphabet.zig").Alphabet;
 /// gaps are inserted for sequences with fewer inserts at that position.
 pub fn parse(allocator: Allocator, abc: *const Alphabet, data: []const u8) !Msa {
     var name_list: std.ArrayList([]const u8) = .empty;
-    defer name_list.deinit(allocator);
+    defer {
+        for (name_list.items) |n| allocator.free(n);
+        name_list.deinit(allocator);
+    }
 
     // First pass: collect raw character sequences (preserving case).
     var raw_seqs: std.ArrayList(std.ArrayList(u8)) = .empty;
@@ -138,17 +141,22 @@ pub fn parse(allocator: Allocator, abc: *const Alphabet, data: []const u8) !Msa 
 
     const result = try Msa.fromText(allocator, abc, name_list.items, text_seqs);
 
-    // Free names (fromText duped them)
+    // Free names (fromText duped them). Clear list to prevent double-free in defer.
     for (name_list.items) |name| allocator.free(name);
+    name_list.items.len = 0;
 
     return result;
 }
 
 fn isConsensusChar(ch: u8) bool {
+    // 'O' is a free-insertion module marker in A2M, not pyrrolysine — skip it.
+    if (ch == 'O') return false;
     return (ch >= 'A' and ch <= 'Z') or ch == '-' or ch == '*';
 }
 
 fn isInsertChar(ch: u8) bool {
+    // 'o' is also skipped (lowercase of FIM marker 'O').
+    if (ch == 'o') return false;
     return (ch >= 'a' and ch <= 'z') or ch == '.';
 }
 
