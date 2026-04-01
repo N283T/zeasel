@@ -326,6 +326,135 @@ pub fn fitCensoredLoc(x: []const f64, n_total: usize, phi: f64, known_lambda: f6
     return -@log(esum / n) / known_lambda;
 }
 
+/// Context for the truncated Gumbel log-likelihood objective and gradient.
+const TruncatedEvdData = struct {
+    x: []const f64,
+    phi: f64,
+};
+
+/// Negative log-likelihood of truncated Gumbel data.
+///
+/// Parameters: p[0] = mu, p[1] = w = log(lambda).
+/// The log-likelihood for observed data above truncation threshold phi is:
+///   L = n*log(lambda) - lambda*sum(x_i - mu) - sum(exp(-lambda*(x_i - mu)))
+///       - n*log_surv(phi, mu, lambda)
+/// We return -L (to minimize).
+fn truncatedEvdFunc(p: []const f64, user_data: ?*anyopaque) f64 {
+    const data: *const TruncatedEvdData = @ptrCast(@alignCast(user_data.?));
+    const x = data.x;
+    const n: f64 = @floatFromInt(x.len);
+    const mu = p[0];
+    const lambda = @exp(p[1]);
+
+    var log_l = n * @log(lambda);
+    for (x) |xi| log_l -= lambda * (xi - mu);
+    for (x) |xi| log_l -= @exp(-lambda * (xi - mu));
+    log_l -= n * logSurv(data.phi, mu, lambda);
+
+    return -log_l;
+}
+
+/// Gradient of the negative log-likelihood for truncated Gumbel data.
+///
+/// Partials w.r.t. mu and w = log(lambda):
+///   dL/dmu    = n*lambda - lambda*sum(exp(-lambda*(x_i-mu))) - n*coeff
+///   dL/dw     = n - lambda*sum(x_i-mu) + lambda*sum((x_i-mu)*exp(-lambda*(x_i-mu)))
+///               + n*(phi-mu)*coeff
+/// where coeff = pdf(phi)/surv(phi), with a numerical guard for phi >> mu.
+fn truncatedEvdGrad(p: []const f64, dp: []f64, user_data: ?*anyopaque) void {
+    const data: *const TruncatedEvdData = @ptrCast(@alignCast(user_data.?));
+    const x = data.x;
+    const n: f64 = @floatFromInt(x.len);
+    const mu = p[0];
+    const lambda = @exp(p[1]);
+    const phi = data.phi;
+
+    // Coefficient: pdf(phi)/surv(phi). Guard against phi >> mu where both -> 0.
+    const coeff = if (lambda * (phi - mu) > 50.0)
+        lambda
+    else
+        pdf(phi, mu, lambda) / surv(phi, mu, lambda);
+
+    // Partial w.r.t. mu
+    var dmu = n * lambda;
+    for (x) |xi| dmu -= lambda * @exp(-lambda * (xi - mu));
+    dmu -= n * coeff;
+
+    // Partial w.r.t. w = log(lambda)
+    var dw = n;
+    for (x) |xi| dw -= (xi - mu) * lambda;
+    for (x) |xi| dw += (xi - mu) * lambda * @exp(-lambda * (xi - mu));
+    dw += n * (phi - mu) * coeff;
+
+    // Negate because we minimize -L
+    dp[0] = -dmu;
+    dp[1] = -dw;
+}
+
+/// Maximum likelihood estimation of Gumbel parameters from left-truncated data
+/// where the number of censored (below-threshold) samples is unknown.
+///
+/// All observed values `x[i]` must satisfy `x[i] >= phi`. The function uses
+/// conjugate gradient descent to maximize the truncated log-likelihood.
+///
+/// `phi` should not be much greater than the true `mu`, or the fit becomes
+/// unstable (the tail looks like a scale-free exponential and `mu` is
+/// undetermined).
+///
+/// Reference: Easel esl_gumbel_FitTruncated().
+pub fn fitTruncated(allocator: std.mem.Allocator, x: []const f64, phi: f64) !struct { mu: f64, lambda: f64 } {
+    if (x.len < 2) return error.InsufficientData;
+
+    // Check that samples are not all identical (lambda would be undefined).
+    for (x[1..]) |xi| {
+        if (xi != x[0]) break;
+    } else {
+        return error.ZeroVariance;
+    }
+
+    // Initial estimates from method of moments on the observed data.
+    const n: f64 = @floatFromInt(x.len);
+    var sum: f64 = 0.0;
+    for (x) |xi| sum += xi;
+    const mean = sum / n;
+
+    var var_sum: f64 = 0.0;
+    for (x) |xi| {
+        const d = xi - mean;
+        var_sum += d * d;
+    }
+    const variance = var_sum / n;
+    if (variance == 0.0) return error.ZeroVariance;
+
+    const lambda_init = math.pi / @sqrt(6.0 * variance);
+    const mu_init = mean - 0.57722 / lambda_init;
+
+    // Pack parameters: p[0] = mu, p[1] = log(lambda)
+    var p = [2]f64{ mu_init, @log(lambda_init) };
+
+    var data = TruncatedEvdData{
+        .x = x,
+        .phi = phi,
+    };
+
+    const minimizer = @import("minimizer.zig");
+    _ = try minimizer.minimize(
+        allocator,
+        &p,
+        truncatedEvdFunc,
+        truncatedEvdGrad,
+        @ptrCast(&data),
+        .{ .tol = 1e-4 },
+    );
+
+    const ret_lambda = @exp(p[1]);
+    if (ret_lambda <= 0.0 or !math.isFinite(ret_lambda) or !math.isFinite(p[0])) {
+        return error.NoResult;
+    }
+
+    return .{ .mu = p[0], .lambda = ret_lambda };
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -492,6 +621,42 @@ test "gumbel fitCensoredLoc recovers mu" {
 test "gumbel fitCensoredLoc error on small input" {
     const x = [_]f64{1.0};
     try std.testing.expectError(error.InsufficientData, fitCensoredLoc(&x, 10, 0.0, 0.5));
+}
+
+test "gumbel fitTruncated recovers parameters" {
+    // Generate 5000 Gumbel(mu=10, lambda=0.5) samples, then keep only those >= phi.
+    const true_mu: f64 = 10.0;
+    const true_lambda: f64 = 0.5;
+    const n = 5000;
+
+    var all_samples: [n]f64 = undefined;
+    var state: u64 = 98765;
+    for (&all_samples) |*s| {
+        state = (state *% 1664525 +% 1013904223) & 0xFFFFFFFF;
+        const u = @as(f64, @floatFromInt(state + 1)) / @as(f64, 0x100000000);
+        s.* = invcdf(u, true_mu, true_lambda);
+    }
+
+    // Truncate: keep only values above phi (simulating unknown censoring).
+    const phi: f64 = 9.5;
+    var observed: [n]f64 = undefined;
+    var n_obs: usize = 0;
+    for (&all_samples) |s| {
+        if (s >= phi) {
+            observed[n_obs] = s;
+            n_obs += 1;
+        }
+    }
+
+    const fit = try fitTruncated(std.testing.allocator, observed[0..n_obs], phi);
+    // Generous tolerances due to sampling variance and truncation.
+    try std.testing.expect(math.approxEqAbs(f64, fit.mu, true_mu, 1.0));
+    try std.testing.expect(math.approxEqAbs(f64, fit.lambda, true_lambda, 0.15));
+}
+
+test "gumbel fitTruncated error on small input" {
+    const x = [_]f64{1.0};
+    try std.testing.expectError(error.InsufficientData, fitTruncated(std.testing.allocator, &x, 0.0));
 }
 
 test "gumbel logCdf matches log(cdf)" {
