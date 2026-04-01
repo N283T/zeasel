@@ -18,17 +18,47 @@ const tree_mod = @import("tree.zig");
 /// count (per-sequence-length normalization, matching Easel's
 /// esl_msaweight_PB_adv). Then weights are normalized to sum to nseq.
 ///
+/// When `symfrac` is non-null, only consensus columns are used:
+///   - If `m.reference` exists, consensus columns are those marked 'x' in it.
+///   - Otherwise, `m.reasonableRF(symfrac)` is called to compute them.
+///   - Non-consensus columns (marked '.') are skipped entirely, including
+///     for the per-sequence-length (rlen) normalization.
+///
 /// Returns an allocated slice of length nseq. Caller owns the memory.
-pub fn positionBased(allocator: Allocator, m: Msa) ![]f64 {
+pub fn positionBased(allocator: Allocator, m: Msa, symfrac: ?f64) ![]f64 {
     const n = m.nseq();
     const k = m.abc.k; // number of canonical residue codes
     const weights = try allocator.alloc(f64, n);
     @memset(weights, 0.0);
 
+    // Determine RF mask: null means use all columns.
+    // When symfrac is provided and m.reference exists, use it directly.
+    // Otherwise compute via reasonableRF. The computed slice is owned by
+    // m.allocator and must be freed after use.
+    var computed_rf: ?[]u8 = null;
+    defer if (computed_rf) |rf| m.allocator.free(rf);
+
+    const rf: ?[]const u8 = blk: {
+        if (symfrac) |sf| {
+            if (m.reference) |ref| {
+                break :blk ref;
+            } else {
+                computed_rf = try m.reasonableRF(sf);
+                break :blk computed_rf.?;
+            }
+        }
+        break :blk null;
+    };
+
     // amino acid kp is 29 — the largest kp we support.
     const MAX_KP = 30;
 
     for (0..m.alen) |col| {
+        // Skip non-consensus columns when RF filtering is active.
+        if (rf) |mask| {
+            if (mask[col] == '.') continue;
+        }
+
         // Count occurrences of each digital code in this column.
         // Only canonical residues (code < K) are counted; degenerate
         // codes (>= K), gaps, missing, and nonresidues are ignored.
@@ -59,10 +89,14 @@ pub fn positionBased(allocator: Allocator, m: Msa) ![]f64 {
     }
 
     // Per-sequence-length normalization: divide each weight by the number
-    // of canonical residues in that sequence (matching Easel's behavior).
+    // of canonical residues in that sequence in consensus columns only
+    // (matching Easel's behavior; respects the same RF mask as above).
     for (0..n) |seq| {
         var rlen: u32 = 0;
         for (0..m.alen) |col| {
+            if (rf) |mask| {
+                if (mask[col] == '.') continue;
+            }
             if (m.seqs[seq][col] < k) rlen += 1;
         }
         if (rlen > 0) weights[seq] /= @floatFromInt(rlen);
@@ -373,7 +407,7 @@ test "positionBased: 3 identical sequences get equal weights" {
     const seqs = [_][]const u8{ "ACGT", "ACGT", "ACGT" };
     var m = try Msa.fromText(allocator, abc, &names, &seqs);
     defer m.deinit();
-    const w = try positionBased(allocator, m);
+    const w = try positionBased(allocator, m, null);
     defer allocator.free(w);
     // After normalization: each weight = 1.0 (sum = 3 = nseq)
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), w[0], 1e-9);
@@ -389,7 +423,7 @@ test "positionBased: 2 completely different sequences each get weight 1.0" {
     const seqs = [_][]const u8{ "AAAA", "TTTT" };
     var m = try Msa.fromText(allocator, abc, &names, &seqs);
     defer m.deinit();
-    const w = try positionBased(allocator, m);
+    const w = try positionBased(allocator, m, null);
     defer allocator.free(w);
     // Both sequences accumulate the same raw weight -> normalize to 1.0 each
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), w[0], 1e-9);
@@ -421,7 +455,7 @@ test "positionBased: known diversity example" {
     const seqs = [_][]const u8{ "ACGT", "ACGT", "TTTT" };
     var m = try Msa.fromText(allocator, abc, &names, &seqs);
     defer m.deinit();
-    const w = try positionBased(allocator, m);
+    const w = try positionBased(allocator, m, null);
     defer allocator.free(w);
 
     // Recompute expected values precisely using fractions.
@@ -434,6 +468,87 @@ test "positionBased: known diversity example" {
     try std.testing.expectApproxEqAbs(13.0 / 16.0, w[0], 1e-9);
     try std.testing.expectApproxEqAbs(13.0 / 16.0, w[1], 1e-9);
     try std.testing.expectApproxEqAbs(11.0 / 8.0, w[2], 1e-9);
+}
+
+test "positionBased: symfrac filters insert columns" {
+    // MSA with 3 sequences, 4 columns.
+    //   s1: AACG
+    //   s2: AACG
+    //   s3: A-CG  (column 1 is a gap / insert for s3)
+    //
+    // RF: x.xx  (column 1 is insert; columns 0, 2, 3 are consensus)
+    //
+    // Without symfrac (null): all 4 columns used.
+    //   col 0: A,A,A -> r=1, n=3 -> each gets 1/3
+    //   col 1: A,A,- -> r=1(A), n=2 -> s1+=1/2, s2+=1/2, s3 skipped
+    //   col 2: C,C,C -> r=1, n=3 -> each gets 1/3
+    //   col 3: G,G,G -> r=1, n=3 -> each gets 1/3
+    //   raw: s1=s2=1/3+1/2+1/3+1/3=3/2, s3=1/3+1/3+1/3=1
+    //   rlen: s1=4 (A,A,C,G), s2=4, s3=3 (A,C,G)
+    //   after rlen: s1=s2=(3/2)/4=3/8, s3=1/3
+    //   sum=3/8+3/8+1/3=9/24+9/24+8/24=26/24=13/12
+    //   scale=3/(13/12)=36/13
+    //   w[0]=w[1]=(3/8)*(36/13)=27/26, w[2]=(1/3)*(36/13)=12/13
+    //
+    // With symfrac=0.6 (RF x.xx -> only cols 0, 2, 3 used):
+    //   col 0: A,A,A -> r=1, n=3 -> each gets 1/3
+    //   col 2: C,C,C -> r=1, n=3 -> each gets 1/3
+    //   col 3: G,G,G -> r=1, n=3 -> each gets 1/3
+    //   raw: all = 1
+    //   rlen (consensus cols only): s1=3, s2=3, s3=3
+    //   after rlen: all = 1/3 -> equal -> normalize to 1.0 each
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+    const names = [_][]const u8{ "s1", "s2", "s3" };
+    const seqs = [_][]const u8{ "AACG", "AACG", "A-CG" };
+    var m = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer m.deinit();
+
+    // Attach RF annotation: column 1 is insert, the rest are consensus.
+    m.reference = try m.allocator.dupe(u8, "x.xx");
+
+    // Without symfrac: the insert column boosts s1/s2 raw weight without a
+    // proportional rlen increase relative to s3, so s1/s2 end up heavier.
+    const w_all = try positionBased(allocator, m, null);
+    defer allocator.free(w_all);
+
+    // With symfrac=0.6 and the explicit RF above: col 1 is skipped.
+    const w_sf = try positionBased(allocator, m, 0.6);
+    defer allocator.free(w_sf);
+
+    // symfrac path: all three sequences see identical consensus columns -> equal weights.
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), w_sf[0], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), w_sf[1], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), w_sf[2], 1e-9);
+
+    // No-symfrac path: s1/s2 get higher weight than s3 (insert col boosts them).
+    try std.testing.expect(w_all[0] > w_all[2]);
+
+    // Exact no-symfrac values: w[0]=w[1]=27/26, w[2]=12/13.
+    try std.testing.expectApproxEqAbs(27.0 / 26.0, w_all[0], 1e-9);
+    try std.testing.expectApproxEqAbs(27.0 / 26.0, w_all[1], 1e-9);
+    try std.testing.expectApproxEqAbs(12.0 / 13.0, w_all[2], 1e-9);
+}
+
+test "positionBased: symfrac computes RF when reference is null" {
+    // Same MSA but without a pre-set RF: reasonableRF should compute it.
+    // Columns 0, 2, 3: occupancy = 3/3 = 1.0 >= symfrac -> 'x'
+    // Column 1: 2/3 occupancy < symfrac=0.7 -> '.'
+    const allocator = std.testing.allocator;
+    const abc = &@import("alphabet.zig").dna;
+    const names = [_][]const u8{ "s1", "s2", "s3" };
+    const seqs = [_][]const u8{ "AACG", "AACG", "A-CG" };
+    var m = try Msa.fromText(allocator, abc, &names, &seqs);
+    defer m.deinit();
+
+    // No reference set — reasonableRF will be called.
+    const w_sf = try positionBased(allocator, m, 0.7);
+    defer allocator.free(w_sf);
+
+    // With only cols 0, 2, 3: all sequences see the same residues -> 1.0 each.
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), w_sf[0], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), w_sf[1], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), w_sf[2], 1e-9);
 }
 
 test "blosum: 3 identical sequences all in one cluster" {
