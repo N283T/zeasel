@@ -263,9 +263,12 @@ pub const Reader = struct {
 
     /// Fetch a sequence by name/accession using the SSI index.
     /// Seeks to the byte offset recorded in the index and parses that single
-    /// record from the in-memory data buffer.
+    /// record from the in-memory data buffer using the appropriate format parser.
     /// Returns null if the key is not found in the index.
     /// Returns error.NoIndex if no SSI index is loaded.
+    /// Returns error.UnsupportedFormat for alignment-only formats that do not
+    /// support random access by record (Stockholm, Clustal, AFA, PHYLIP, A2M,
+    /// PSI-BLAST, SELEX, Pfam).
     pub fn fetch(self: *Reader, key: []const u8) !?Sequence {
         var index = self.ssi_index orelse return error.NoIndex;
         const entry = (try index.lookup(self.allocator, key)) orelse return null;
@@ -274,7 +277,12 @@ pub const Reader = struct {
         if (offset >= self.data.len) return error.InvalidOffset;
 
         var pos = @as(usize, @intCast(offset));
-        return try fasta.parseOne(self.allocator, self.abc, self.data, &pos);
+        return switch (self.format) {
+            .fasta, .afa, .a2m => try fasta.parseOne(self.allocator, self.abc, self.data, &pos),
+            .genbank, .ddbj => try genbank.parseOneGenBank(self.allocator, self.abc, self.data, &pos),
+            .embl => try genbank.parseOneEmbl(self.allocator, self.abc, self.data, &pos),
+            .stockholm, .pfam, .clustal, .phylip, .psiblast, .selex => return error.UnsupportedFormat,
+        };
     }
 
     /// Fetch a subsequence by name and coordinate range (1-indexed, inclusive).
