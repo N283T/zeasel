@@ -232,4 +232,6 @@ Full comparison of Easel's C modules and their zeasel status.
 
 ## License
 
-See [LICENSE](LICENSE).
+BSD 2-Clause License. See [LICENSE](LICENSE).
+
+zeasel is a reimplementation of [Easel](https://github.com/EddyRivasLab/easel) (also BSD 2-Clause). Algorithms, constants, and format specifications are derived from Easel. See [NOTICE](NOTICE) for full attribution.

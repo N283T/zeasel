@@ -1,0 +1,68 @@
+NOTICE — Third-Party Acknowledgements
+
+zeasel is a Zig reimplementation of the Easel C library for biological
+sequence analysis. While no source code was copied, the algorithms,
+numerical constants, data tables, and API design are derived from Easel.
+
+================================================================================
+Easel
+================================================================================
+
+  Copyright (C) 1990-2023 Sean R. Eddy
+  Copyright (C) 2015-2023 President and Fellows of Harvard College
+  Copyright (C) 2000-2023 Howard Hughes Medical Institute
+  Copyright (C) 1995-2006 Washington University School of Medicine
+  Copyright (C) 1992-1995 MRC Laboratory of Molecular Biology, UK
+
+  Licensed under the BSD 2-Clause License.
+  https://github.com/EddyRivasLab/easel
+
+  Easel development is supported in part by the National Human Genome
+  Research Institute of the US National Institutes of Health under grant
+  number R01HG009116.
+
+The following elements are derived from Easel:
+
+  - Statistical distribution algorithms (Gumbel, GEV, gamma, exponential,
+    Weibull, normal, lognormal, Dirichlet)
+  - Conjugate gradient minimizer with Brent line search
+  - Incomplete gamma function (continued fraction and series)
+  - BLOSUM and PAM score matrix values
+  - WAG exchangeability parameters and equilibrium frequencies
+  - NCBI genetic code translation tables
+  - SSI (Sequence/Subsequence Index) binary format specification
+  - dsqdata binary packed sequence format specification
+  - Sequence weighting algorithms (PB, BLOSUM, GSC)
+  - Cobalt/Blue independent set algorithms (Petti & Eddy 2022)
+  - WUSS RNA secondary structure notation handling
+
+================================================================================
+Algorithms and constants from other sources (via Easel)
+================================================================================
+
+  Mersenne Twister RNG
+    Takuji Nishimura and Makoto Matsumoto
+    Copyright (C) 1997-2002
+    BSD License
+
+  SIMD vectorized logf/expf (Cephes polynomial approximations)
+    Stephen Moshier (original C)
+    Julien Pommier (SSE adaptation)
+    Public domain / zlib license
+
+  erfc() implementation
+    Sun Microsystems, Inc.
+    Copyright (C) 1993
+    Freely redistributable
+
+  Jenkins one-at-a-time hash
+    Bob Jenkins
+    Public domain
+
+  Gamma deviate (Marsaglia-Tsang method)
+    George Marsaglia and Wai Wan Tsang
+    "A Simple Method for Generating Gamma Variables" (2000)
+
+  Altschul-Erickson dinucleotide shuffle
+    Stephen F. Altschul and Bruce W. Erickson
+    "Significance of Nucleotide Sequence Alignments" (1985)
