@@ -1152,7 +1152,11 @@ pub fn probifyGivenBG(
 
     for (0..max_iter) |_| {
         const x0 = lambda;
-        lambda = lambda - fx / dfx;
+        var new_lambda = lambda - fx / dfx;
+        if (new_lambda <= 0) {
+            new_lambda = lambda / 2.0; // bisect toward zero but stay positive
+        }
+        lambda = new_lambda;
 
         fx = evalLambdaFunc(sm, fi, fj, k, lambda);
         dfx = evalLambdaDeriv(sm, fi, fj, k, lambda);
