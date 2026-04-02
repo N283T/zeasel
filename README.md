@@ -5,11 +5,11 @@ A Zig reimplementation of [Easel](https://github.com/EddyRivasLab/easel), the C 
 ## Features
 
 - **Biological alphabets** — DNA, RNA, amino acid with comptime lookup tables, degeneracy resolution, scoring/counting, robust alphabet guessing
-- **Sequence I/O** — FASTA, Stockholm (multi-MSA), GenBank, EMBL, DDBJ, Clustal, aligned FASTA, PHYLIP (interleaved+sequential), A2M, PSI-BLAST, SELEX, Pfam; gzip auto-decompression, stdin support, SSI random-access fetch
-- **Streaming I/O** — `WindowReader` for chromosome-scale sequences with overlapping windows
+- **Sequence I/O** — FASTA, Stockholm (multi-MSA), GenBank, EMBL, DDBJ, Clustal, aligned FASTA, PHYLIP (interleaved+sequential), A2M, PSI-BLAST, SELEX, Pfam; gzip auto-decompression, stdin support, SSI random-access fetch, unified `readMsa()`
+- **Streaming I/O** — `WindowReader` for chromosome-scale sequences with overlapping windows and automatic reverse complement (DNA/RNA)
 - **Multiple sequence alignment** — MSA operations, weighting (PB/BLOSUM/GSC), clustering, gap manipulation, bootstrap resampling, vertical shuffle, FlushLeftInserts, identity filtering (IDFilter), broken base-pair repair
 - **SIMD vector operations** — comptime-generic `@Vector`-based ops with automatic ISA selection; logNorm, relativeEntropy, sort, validate, log/exp
-- **Statistical distributions** — Gumbel, gamma, exponential, normal, Weibull, Dirichlet, mixture Dirichlet; full PDF/CDF/surv/logPdf/logCdf/logSurv/invcdf; MLE fitting for all distributions; censored/truncated Gumbel fitting
+- **Statistical distributions** — Gumbel, GEV, gamma, exponential, normal, Weibull, lognormal, Dirichlet, mixture Dirichlet; full PDF/CDF/surv/logPdf/logCdf/logSurv/invcdf; MLE fitting for all distributions; censored/truncated Gumbel fitting
 - **Statistical functions** — logGamma, digamma, chi-squared test, G-test, linear regression, high-precision erfc (C library)
 - **Numerical optimization** — conjugate gradient minimizer with bracket+Brent line search, Brent's root finder
 - **Score matrices** — BLOSUM45/62/80, PAM30/70/120/250; i16 scores with Kp×Kp degenerate residue support; BLAST format I/O; named lookup, probability analysis
@@ -148,6 +148,8 @@ Full comparison of Easel's C modules and their zeasel status.
 | `esl_cluster` | `cluster.zig` | Generalized single-linkage clustering |
 | `esl_vectorops` | `simd/vector_ops.zig` | Comptime-generic SIMD; logNorm, relativeEntropy, sort, validate |
 | `esl_gumbel` | `stats/gumbel.zig` | Full PDF/CDF/surv/log-space; complete + censored MLE fitting |
+| `esl_gev` | `stats/gev.zig` | GEV distribution with lambda parameterization; MLE fitting |
+| `esl_lognormal` | `stats/lognormal.zig` | Lognormal distribution with PDF/CDF/surv/log-space |
 | `esl_exponential` | `stats/exponential.zig` | Full PDF/CDF/surv/log-space; MLE fitting |
 | `esl_gamma` | `stats/gamma.zig` | Full PDF/CDF/surv/log-space/invcdf; Minka MLE fitting |
 | `esl_normal` | `stats/normal.zig` | High-precision erfc-based CDF/surv |
@@ -211,8 +213,8 @@ Full comparison of Easel's C modules and their zeasel status.
 | `esl_sqio_ncbi` | NCBI BLAST database format — specialized |
 | `esl_swat` | Smith-Waterman — marked UNFINISHED in Easel |
 | `esl_hmm` | General discrete HMMs — not profile HMMs (HMMER has its own) |
-| `esl_gev`, `esl_mixgev` | Generalized extreme value — research only |
-| `esl_hyperexp`, `esl_stretchexp`, `esl_lognormal` | Niche distributions — not used by HMMER core |
+| `esl_mixgev` | Mixture GEV — research only |
+| `esl_hyperexp`, `esl_stretchexp` | Niche distributions — not used by HMMER core |
 | `esl_matrixops` | C array helpers — replaced by `matrix.zig` |
 | `interface_gsl`, `interface_lapack` | External C library wrappers — pure Zig implementations instead |
 

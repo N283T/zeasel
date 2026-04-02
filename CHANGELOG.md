@@ -6,16 +6,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-04-02
+
 ### Added
 
+- **Reader.readMsa()** — Format-agnostic MSA reading through unified Reader interface (#164, PR #184)
+- **WindowReader reverse complement** — Automatic reverse complement strand reading for DNA/RNA with Strand enum (#162, PR #189)
 - **SSI dual-format support** — Read both zeasel native and Easel SSI v3.0 index formats, auto-detected by magic bytes. Easel SSI uses disk-based binary search for O(log n) lookup without loading keys into memory (#63)
-- **Comprehensive Easel review** — 58 issues identified and fixed via systematic comparison with Easel C source (#61-#72, PRs #73-#101)
+- **Comprehensive Easel review** — Systematic comparison with Easel C source across all modules (#61-#72, #159-#175)
 
-### Fixed (Easel review — CRITICAL)
+### Fixed (Easel review round 2 — CRITICAL)
+
+- Fix dsqdata Easel format: correct 52-byte header layout (was 56), fix index record interpretation (packet counts vs byte offsets), add stub file validation (#159, PR #190)
+- Fix mixdchlet stack buffer overflow in fitting callbacks by threading allocator through context (#160, PR #183)
+- Fix Reader.fetch() to dispatch by format instead of hardcoding FASTA (#161, PR #181)
+
+### Fixed (Easel review round 2 — HIGH)
+
+- Fix Gumbel logSurv missing third case for very negative z; improve invsurv small-p approximation (#166, PR #179)
+- Switch GEV to lambda (rate) parameterization matching Easel convention (#167, PR #187)
+- Fix matrix exponential to use Frobenius norm (threshold 0.1) instead of element-max norm (0.5) (#168, PR #178)
+- Fix score_matrix probifyGivenBG Newton-Raphson to guard against lambda=0 convergence (#169, PR #177)
+- Fix SELEX parser to store #=SS/#=SA as per-sequence annotations instead of consensus (#163, PR #188)
+- Fix EMBL parser to accumulate multi-line DE descriptions (#165, PR #182)
+- Increase Huffman MAX_CODE_LEN from 31 to 32; document u8 byte-packing format (#171, PR #186)
+- Fix gencode translateFrame to handle degenerate bases via translateAmbiguous instead of treating as stop (#172, PR #176)
+
+### Fixed (Easel review round 1 — CRITICAL)
 
 - Fix Polak-Ribière beta denominator bug in conjugate gradient minimizer (#61)
 
-### Fixed (Easel review — HIGH)
+### Fixed (Easel review round 1 — HIGH)
 
 - Fix amino acid U/O degeneracy: U→C, O→K instead of all 20 residues (#64)
 - Replace sequence checksum with Jenkins one-at-a-time hash for Easel compatibility (#64)
