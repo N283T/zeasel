@@ -272,15 +272,15 @@ pub const Matrix = struct {
         if (self.rows != self.cols) return error.DimensionMismatch;
         const n = self.rows;
 
-        // Scale: find s such that ||t*M/2^s|| < 1
+        // Scale: find s such that ||t*M/2^s|| < 0.1 (Frobenius norm, per Moler & Van Loan 2003)
         var norm: f64 = 0;
         for (self.data) |v| {
-            const av = @abs(t * v);
-            if (av > norm) norm = av;
+            norm += (t * v) * (t * v);
         }
+        norm = @sqrt(norm);
 
         var s: u32 = 0;
-        while (norm > 0.5) {
+        while (norm > 0.1) {
             norm /= 2.0;
             s += 1;
         }
