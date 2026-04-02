@@ -435,16 +435,16 @@ pub fn translateFrame(allocator: Allocator, gc: *const GeneticCode, dsq: []const
     var result = try std.ArrayList(u8).initCapacity(allocator, n_codons);
     errdefer result.deinit(allocator);
 
+    const dna_abc = &@import("alphabet.zig").dna;
     var pos: usize = frame;
     while (pos + 3 <= dsq.len) {
-        if (dsq[pos] >= 4 or dsq[pos + 1] >= 4 or dsq[pos + 2] >= 4) {
-            // Degenerate/gap base: emit STOP_CODON as marker for untranslatable codon
-            try result.append(allocator, STOP_CODON);
-        } else {
-            const idx = @as(usize, dsq[pos]) * 16 + @as(usize, dsq[pos + 1]) * 4 + @as(usize, dsq[pos + 2]);
-            const aa = gc.codon_table[idx];
-            try result.append(allocator, aa);
-        }
+        const c1 = dsq[pos];
+        const c2 = dsq[pos + 1];
+        const c3 = dsq[pos + 2];
+        const aa = gc.translate(c1, c2, c3) orelse
+            gc.translateAmbiguous(dna_abc, c1, c2, c3) orelse
+            @import("alphabet.zig").amino.unknownCode(); // X for unresolvable degenerate codons
+        try result.append(allocator, aa);
         pos += 3;
     }
 
