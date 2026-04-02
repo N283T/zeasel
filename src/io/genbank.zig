@@ -212,7 +212,9 @@ pub fn parseAllEmbl(allocator: Allocator, abc: *const Alphabet, data: []const u8
 pub fn parseOneEmbl(allocator: Allocator, abc: *const Alphabet, data: []const u8, pos: *usize) !Sequence {
     var name: ?[]const u8 = null;
     var accession: ?[]const u8 = null;
-    var description: ?[]const u8 = null;
+    // description may span multiple DE continuation lines
+    var desc_buf = std.ArrayList(u8){};
+    defer desc_buf.deinit(allocator);
     var in_sequence = false;
     var found_terminator = false;
 
@@ -273,10 +275,11 @@ pub fn parseOneEmbl(allocator: Allocator, abc: *const Alphabet, data: []const u8
                 accession = rest[0..end];
             }
         } else if (std.mem.eql(u8, tag, "DE")) {
-            if (description == null) {
-                const rest = std.mem.trimLeft(u8, line[2..], " \t");
-                description = rest;
+            const rest = std.mem.trimLeft(u8, line[2..], " \t");
+            if (desc_buf.items.len > 0) {
+                try desc_buf.append(allocator, ' ');
             }
+            try desc_buf.appendSlice(allocator, rest);
         } else if (std.mem.eql(u8, tag, "SQ")) {
             in_sequence = true;
         }
@@ -298,10 +301,8 @@ pub fn parseOneEmbl(allocator: Allocator, abc: *const Alphabet, data: []const u8
     errdefer if (acc_copy) |acc| allocator.free(acc);
 
     var desc_copy: ?[]const u8 = null;
-    if (description) |desc| {
-        if (desc.len > 0) {
-            desc_copy = try allocator.dupe(u8, desc);
-        }
+    if (desc_buf.items.len > 0) {
+        desc_copy = try allocator.dupe(u8, desc_buf.items);
     }
     errdefer if (desc_copy) |d| allocator.free(d);
 
@@ -658,6 +659,31 @@ test "parseAllEmbl: multi-record buffer" {
     try std.testing.expectEqual(@as(usize, 2), seqs.len);
     try std.testing.expectEqualStrings("SEQ1", seqs[0].name);
     try std.testing.expectEqualStrings("SEQ2", seqs[1].name);
+}
+
+test "parseAllEmbl: multi-line DE description" {
+    const allocator = std.testing.allocator;
+    const data =
+        \\ID   P12345; SV 1;
+        \\AC   P12345;
+        \\DE   RecName: Full=Glucosidase;
+        \\DE   Short=Beta-Glu;
+        \\SQ   Sequence 4 BP;
+        \\     acgt
+        \\//
+        \\
+    ;
+    const seqs = try parseAllEmbl(allocator, &alphabet_mod.dna, data);
+    defer {
+        for (seqs) |*s| @constCast(s).deinit();
+        allocator.free(seqs);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), seqs.len);
+    try std.testing.expectEqualStrings(
+        "RecName: Full=Glucosidase; Short=Beta-Glu;",
+        seqs[0].description.?,
+    );
 }
 
 test "writeGenBank: basic structure" {
