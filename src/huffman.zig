@@ -2,18 +2,24 @@
 //
 // Builds a canonical Huffman code from symbol frequencies and provides
 // encode/decode operations. Used for compressed sequence storage.
+//
+// Packing format: bits are packed MSB-first into u8 bytes.
+// This is zeasel's own internal format and intentionally differs from Easel's
+// Huffman implementation, which packs bits into uint32 words. Since zeasel uses
+// its own dsqdata binary format (not Easel's), byte-level packing is preferred
+// for simplicity and portability.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-/// Maximum code length supported (u5 max = 31).
-const MAX_CODE_LEN = 31;
+/// Maximum code length supported (32 bits, matching the natural limit for u32 codes).
+const MAX_CODE_LEN = 32;
 
 pub const HuffmanCode = struct {
     /// Code word for each symbol (bit pattern stored in u32).
     codes: []u32,
-    /// Code length (bits) for each symbol.
-    lengths: []u5,
+    /// Code length (bits) for each symbol. u6 holds values 0..63, sufficient for MAX_CODE_LEN=32.
+    lengths: []u6,
     /// Number of symbols.
     n_symbols: usize,
     /// Decoding table indexed by code length (1..MAX_CODE_LEN).
@@ -36,7 +42,7 @@ pub const HuffmanCode = struct {
         if (n_active == 0) return error.InvalidInput;
 
         // Allocate output arrays; zero-frequency symbols get code 0, length 0
-        const lengths = try allocator.alloc(u5, n);
+        const lengths = try allocator.alloc(u6, n);
         errdefer allocator.free(lengths);
         @memset(lengths, 0);
         const codes = try allocator.alloc(u32, n);
@@ -143,7 +149,7 @@ pub const HuffmanCode = struct {
         }
 
         // Traverse tree to assign lengths
-        const depth = try allocator.alloc(u5, tree_size);
+        const depth = try allocator.alloc(u6, tree_size);
         defer allocator.free(depth);
         @memset(depth, 0);
 
@@ -165,14 +171,14 @@ pub const HuffmanCode = struct {
         defer allocator.free(code_order);
         for (0..n_active) |i| code_order[i] = indices[i];
         std.mem.sort(usize, code_order, lengths, struct {
-            fn lessThan(l: []const u5, a: usize, b: usize) bool {
+            fn lessThan(l: []const u6, a: usize, b: usize) bool {
                 if (l[a] != l[b]) return l[a] < l[b];
                 return a < b;
             }
         }.lessThan);
 
         var code: u32 = 0;
-        var prev_len: u5 = lengths[code_order[0]];
+        var prev_len: u6 = lengths[code_order[0]];
         codes[code_order[0]] = 0;
         for (1..n_active) |i| {
             code += 1;
@@ -231,6 +237,7 @@ pub const HuffmanCode = struct {
 
     /// Encode a sequence of symbols into a packed bitstream.
     /// Returns the packed bytes and the total number of valid bits.
+    /// Bits are packed MSB-first into u8 bytes (zeasel's internal format).
     pub fn encode(self: HuffmanCode, allocator: Allocator, symbols: []const u8) !struct { data: []u8, nbits: usize } {
         // Compute total bits needed
         var total_bits: usize = 0;
@@ -278,10 +285,10 @@ pub const HuffmanCode = struct {
                 code = (code << 1) | bit;
                 bit_pos += 1;
                 // Look up in the decoding table for this code length.
-                if (self.decode_symbols[len]) |symbols| {
+                if (self.decode_symbols[len]) |syms| {
                     const first = self.decode_first_code[len];
-                    if (code >= first and code - first < symbols.len) {
-                        try result.append(allocator, symbols[code - first]);
+                    if (code >= first and code - first < syms.len) {
+                        try result.append(allocator, syms[code - first]);
                         found = true;
                         break;
                     }
@@ -316,7 +323,7 @@ test "build: uniform frequencies give equal-ish lengths" {
     try std.testing.expectEqual(@as(usize, 4), hc.n_symbols);
     // All lengths should be 2 for 4 uniform symbols
     for (hc.lengths) |l| {
-        try std.testing.expectEqual(@as(u5, 2), l);
+        try std.testing.expectEqual(@as(u6, 2), l);
     }
 }
 
@@ -338,8 +345,8 @@ test "build: 2 symbols" {
     var hc = try HuffmanCode.build(allocator, &freq);
     defer hc.deinit();
 
-    try std.testing.expectEqual(@as(u5, 1), hc.lengths[0]);
-    try std.testing.expectEqual(@as(u5, 1), hc.lengths[1]);
+    try std.testing.expectEqual(@as(u6, 1), hc.lengths[0]);
+    try std.testing.expectEqual(@as(u6, 1), hc.lengths[1]);
     // Codes should be 0 and 1
     try std.testing.expect(hc.codes[0] != hc.codes[1]);
 }
@@ -385,9 +392,9 @@ test "build: zero-frequency symbols excluded from tree" {
 
     try std.testing.expectEqual(@as(usize, 5), hc.n_symbols);
     // Zero-frequency symbols get length 0 and code 0
-    try std.testing.expectEqual(@as(u5, 0), hc.lengths[1]);
+    try std.testing.expectEqual(@as(u6, 0), hc.lengths[1]);
     try std.testing.expectEqual(@as(u32, 0), hc.codes[1]);
-    try std.testing.expectEqual(@as(u5, 0), hc.lengths[3]);
+    try std.testing.expectEqual(@as(u6, 0), hc.lengths[3]);
     try std.testing.expectEqual(@as(u32, 0), hc.codes[3]);
     // Non-zero symbols get positive lengths
     try std.testing.expect(hc.lengths[0] > 0);
@@ -417,12 +424,12 @@ test "decode table: direct lookup matches encode for 8-symbol alphabet" {
     for (0..hc.n_symbols) |s| {
         const len = hc.lengths[s];
         if (len == 0) continue;
-        const symbols = hc.decode_symbols[len] orelse {
+        const syms = hc.decode_symbols[len] orelse {
             return error.InvalidBitstream;
         };
         const first = hc.decode_first_code[len];
         const offset = hc.codes[s] - first;
-        try std.testing.expectEqual(@as(u8, @intCast(s)), symbols[offset]);
+        try std.testing.expectEqual(@as(u8, @intCast(s)), syms[offset]);
     }
 
     // Round-trip all symbols.
