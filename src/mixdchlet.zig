@@ -287,6 +287,7 @@ pub const MixDirichlet = struct {
             .counts = counts,
             .n_components = self.n_components,
             .n_categories = self.n_categories,
+            .allocator = allocator,
         };
 
         const nll = try minimizer.minimize(
@@ -344,6 +345,7 @@ pub const MixDirichlet = struct {
         counts: []const []const f64,
         n_components: usize,
         n_categories: usize,
+        allocator: Allocator,
     };
 
     /// Negative log-likelihood of all count vectors under the mixture Dirichlet.
@@ -352,6 +354,7 @@ pub const MixDirichlet = struct {
         const ctx: *FitContext = @ptrCast(@alignCast(user_data.?));
         const k_count = ctx.n_components;
         const a_count = ctx.n_categories;
+        const alloc = ctx.allocator;
 
         // Decode weights via softmax
         var max_lw: f64 = -math.inf(f64);
@@ -359,9 +362,8 @@ pub const MixDirichlet = struct {
             if (params[k] > max_lw) max_lw = params[k];
         }
         var sum_w: f64 = 0;
-        // Use stack buffer for small sizes, heap would require allocator
-        var weights_buf: [64]f64 = undefined;
-        const weights = weights_buf[0..k_count];
+        const weights = alloc.alloc(f64, k_count) catch return math.inf(f64);
+        defer alloc.free(weights);
         for (0..k_count) |k| {
             weights[k] = @exp(params[k] - max_lw);
             sum_w += weights[k];
@@ -370,11 +372,15 @@ pub const MixDirichlet = struct {
 
         // Decode alphas
         const offset = k_count;
-        var alpha_buf: [1024]f64 = undefined;
-        const alpha = alpha_buf[0 .. k_count * a_count];
+        const alpha = alloc.alloc(f64, k_count * a_count) catch return math.inf(f64);
+        defer alloc.free(alpha);
         for (0..k_count * a_count) |i| {
             alpha[i] = @exp(params[offset + i]);
         }
+
+        // Per-count log-probability scratch buffer, reused across count vectors
+        const lp = alloc.alloc(f64, k_count) catch return math.inf(f64);
+        defer alloc.free(lp);
 
         // Compute negative log-likelihood
         var nll: f64 = 0;
@@ -382,8 +388,6 @@ pub const MixDirichlet = struct {
             // log P(c | mixture) = log sum_k q_k * P(c | alpha_k)
             // Use log-sum-exp for stability
             var max_log: f64 = -math.inf(f64);
-            var lp_buf: [64]f64 = undefined;
-            const lp = lp_buf[0..k_count];
             for (0..k_count) |k| {
                 lp[k] = @log(@max(weights[k], 1e-300)) + logProbDirichlet(alpha[k * a_count .. (k + 1) * a_count], c);
                 if (lp[k] > max_log) max_log = lp[k];
@@ -401,6 +405,7 @@ pub const MixDirichlet = struct {
         const ctx: *FitContext = @ptrCast(@alignCast(user_data.?));
         const k_count = ctx.n_components;
         const a_count = ctx.n_categories;
+        const alloc = ctx.allocator;
 
         // Decode weights via softmax
         var max_lw: f64 = -math.inf(f64);
@@ -408,8 +413,11 @@ pub const MixDirichlet = struct {
             if (params[k] > max_lw) max_lw = params[k];
         }
         var sum_w: f64 = 0;
-        var weights_buf: [64]f64 = undefined;
-        const weights = weights_buf[0..k_count];
+        const weights = alloc.alloc(f64, k_count) catch {
+            @memset(grad, 0);
+            return;
+        };
+        defer alloc.free(weights);
         for (0..k_count) |k| {
             weights[k] = @exp(params[k] - max_lw);
             sum_w += weights[k];
@@ -418,11 +426,26 @@ pub const MixDirichlet = struct {
 
         // Decode alphas
         const offset = k_count;
-        var alpha_buf: [1024]f64 = undefined;
-        const alpha = alpha_buf[0 .. k_count * a_count];
+        const alpha = alloc.alloc(f64, k_count * a_count) catch {
+            @memset(grad, 0);
+            return;
+        };
+        defer alloc.free(alpha);
         for (0..k_count * a_count) |i| {
             alpha[i] = @exp(params[offset + i]);
         }
+
+        // Scratch buffers reused across count vectors
+        const lp = alloc.alloc(f64, k_count) catch {
+            @memset(grad, 0);
+            return;
+        };
+        defer alloc.free(lp);
+        const post = alloc.alloc(f64, k_count) catch {
+            @memset(grad, 0);
+            return;
+        };
+        defer alloc.free(post);
 
         // Zero gradient
         @memset(grad, 0);
@@ -430,15 +453,11 @@ pub const MixDirichlet = struct {
         for (ctx.counts) |c| {
             // Compute posterior weights for this count vector
             var max_log: f64 = -math.inf(f64);
-            var lp_buf: [64]f64 = undefined;
-            const lp = lp_buf[0..k_count];
             for (0..k_count) |k| {
                 lp[k] = @log(@max(weights[k], 1e-300)) + logProbDirichlet(alpha[k * a_count .. (k + 1) * a_count], c);
                 if (lp[k] > max_log) max_log = lp[k];
             }
             var total: f64 = 0;
-            var post_buf: [64]f64 = undefined;
-            const post = post_buf[0..k_count];
             for (0..k_count) |k| {
                 post[k] = @exp(lp[k] - max_log);
                 total += post[k];
