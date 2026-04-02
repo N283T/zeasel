@@ -39,11 +39,17 @@ pub fn surv(x: f64, mu: f64, lambda: f64) f64 {
 }
 
 /// Log survival: log(1 - exp(-exp(-z)))
-/// Uses log1p for numerical stability when survival is near 1 (z is very negative).
-/// For large positive z, surv ~ exp(-z), so log_surv ~ -exp(-z) avoids log1p(-1) = -inf.
+/// Three-way split for numerical stability:
+///   z < -2.9: CDF ~ exp(-exp(-z)) ~ 0, so surv ~ 1; use -exp(-exp(-z)) via log1p avoidance
+///   z > 10.0: surv ~ exp(-z), so log_surv ~ -exp(-z) avoids log1p(-1) = -inf
+///   middle:   log1p(-exp(-exp(-z))) is accurate
 pub fn logSurv(x: f64, mu: f64, lambda: f64) f64 {
     const z = lambda * (x - mu);
-    // For large z, surv ~ exp(-z), so log_surv ~ -exp(-z)
+    // Very negative z: CDF is near 0, surv is near 1.
+    // exp(-exp(-z)) rounds to 1.0, causing log1p(-1.0) = -inf.
+    // Use -exp(-exp(-z)) directly (first-order: log(1-u) ~ -u for small u).
+    if (z < -2.9) return -@exp(-@exp(-z));
+    // Large positive z: surv ~ exp(-z); log(surv) ~ -exp(-z).
     if (z > 10.0) return -@exp(-z);
     return math.log1p(-@exp(-@exp(-z)));
 }
@@ -61,15 +67,15 @@ pub fn invcdf(p: f64, mu: f64, lambda: f64) f64 {
 }
 
 /// Inverse survival: mu - (1/lambda) * log(-log(1-p))
-/// For very small p (< 5e-9), uses a numerically stable approximation
-/// to avoid catastrophic cancellation in 1.0 - p.
+/// For very small p (< 5e-9), uses the Easel numerically stable approximation
+/// (p^p - 1) / p instead of log(p) to avoid catastrophic cancellation in 1.0 - p.
 /// Reference: Easel esl_gumbel_invsurv().
 pub fn invsurv(p: f64, mu: f64, lambda: f64) f64 {
     // For very small p, 1.0 - p loses precision (rounds to 1.0 when p < ~1e-16).
-    // Use the approximation: log(-log(1-p)) ≈ log(p) for small p.
-    // More precisely: log(1-p) ≈ -p for small p, so -log(1-p) ≈ p, so log(-log(1-p)) ≈ log(p).
+    // Easel uses (p^p - 1) / p which is more accurate near the threshold than log(p).
     if (p < 5e-9) {
-        return mu - (1.0 / lambda) * @log(p);
+        const log_part = (std.math.pow(f64, p, p) - 1.0) / p;
+        return mu - (1.0 / lambda) * log_part;
     }
     return invcdf(1.0 - p, mu, lambda);
 }
