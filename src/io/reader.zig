@@ -8,11 +8,13 @@ const Sequence = @import("../sequence.zig").Sequence;
 const ssi_mod = @import("../ssi.zig");
 const SsiIndex = ssi_mod.SsiIndex;
 const ZeaselIndex = ssi_mod.ZeaselIndex;
+const Msa = @import("../msa.zig").Msa;
 const fasta = @import("fasta.zig");
 const stockholm = @import("stockholm.zig");
 const genbank = @import("genbank.zig");
 const clustal = @import("clustal.zig");
 const phylip = @import("phylip.zig");
+const afa = @import("afa.zig");
 const a2m = @import("a2m.zig");
 const psiblast = @import("psiblast.zig");
 const selex = @import("selex.zig");
@@ -401,6 +403,43 @@ pub const Reader = struct {
         return list.toOwnedSlice(self.allocator);
     }
 
+    /// Read the entire input as a single MSA. Returns null if the data is empty.
+    /// Supported formats: stockholm, pfam, clustal, afa, phylip, a2m, psiblast, selex.
+    /// Returns error.UnsupportedFormat for sequence-only formats (fasta, genbank, embl, ddbj).
+    pub fn readMsa(self: *Reader) !?Msa {
+        return switch (self.format) {
+            .stockholm, .pfam => blk: {
+                if (self.data.len == 0) break :blk null;
+                break :blk try stockholm.parse(self.allocator, self.abc, self.data);
+            },
+            .clustal => blk: {
+                if (self.data.len == 0) break :blk null;
+                break :blk try clustal.parse(self.allocator, self.abc, self.data);
+            },
+            .afa => blk: {
+                if (self.data.len == 0) break :blk null;
+                break :blk try afa.parse(self.allocator, self.abc, self.data);
+            },
+            .phylip => blk: {
+                if (self.data.len == 0) break :blk null;
+                break :blk try phylip.parse(self.allocator, self.abc, self.data);
+            },
+            .a2m => blk: {
+                if (self.data.len == 0) break :blk null;
+                break :blk try a2m.parse(self.allocator, self.abc, self.data);
+            },
+            .psiblast => blk: {
+                if (self.data.len == 0) break :blk null;
+                break :blk try psiblast.parse(self.allocator, self.abc, self.data);
+            },
+            .selex => blk: {
+                if (self.data.len == 0) break :blk null;
+                break :blk try selex.parse(self.allocator, self.abc, self.data);
+            },
+            .fasta, .genbank, .embl, .ddbj => error.UnsupportedFormat,
+        };
+    }
+
     fn nextGenBank(self: *Reader) !?Sequence {
         if (self.gb_seqs == null) {
             const seqs = try genbank.parseAllGenBank(self.allocator, self.abc, self.data);
@@ -498,8 +537,7 @@ pub const Reader = struct {
     }
 
     fn nextAfa(self: *Reader) !?Sequence {
-        const afa_mod = @import("afa.zig");
-        return self.nextMsaFormat(afa_mod.parse);
+        return self.nextMsaFormat(afa.parse);
     }
 
     fn nextPhylip(self: *Reader) !?Sequence {
@@ -1258,6 +1296,102 @@ test "Reader.fromFile: stdin path is recognized" {
     // would block waiting for input. We verify the path comparison logic
     // that drives stdin selection by testing the helpers it depends on.
     try std.testing.expect(std.mem.eql(u8, "-", "-"));
+}
+
+test "Reader.readMsa: stockholm format returns Msa" {
+    const allocator = std.testing.allocator;
+    const data = "# STOCKHOLM 1.0\n\nseq1  AC-GT\nseq2  ACGGT\n//\n";
+
+    var reader = try Reader.fromMemory(allocator, &alphabet_mod.dna, data, null);
+    defer reader.deinit();
+
+    var msa = (try reader.readMsa()) orelse return error.ExpectedMsa;
+    defer msa.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), msa.nseq());
+    try std.testing.expectEqual(@as(usize, 5), msa.alen);
+    try std.testing.expectEqualStrings("seq1", msa.names[0]);
+    try std.testing.expectEqualStrings("seq2", msa.names[1]);
+}
+
+test "Reader.readMsa: clustal format returns Msa" {
+    const allocator = std.testing.allocator;
+    const data =
+        \\CLUSTAL W (1.83) multiple sequence alignment
+        \\
+        \\seq1      AC-GT
+        \\seq2      ACGGT
+        \\
+        \\
+    ;
+
+    var reader = try Reader.fromMemory(allocator, &alphabet_mod.dna, data, null);
+    defer reader.deinit();
+
+    var msa = (try reader.readMsa()) orelse return error.ExpectedMsa;
+    defer msa.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), msa.nseq());
+    try std.testing.expectEqualStrings("seq1", msa.names[0]);
+}
+
+test "Reader.readMsa: afa format returns Msa" {
+    const allocator = std.testing.allocator;
+    const data =
+        \\>seq1
+        \\AC-GT
+        \\>seq2
+        \\ACGGT
+        \\
+    ;
+
+    var reader = try Reader.fromMemory(allocator, &alphabet_mod.dna, data, .afa);
+    defer reader.deinit();
+
+    var msa = (try reader.readMsa()) orelse return error.ExpectedMsa;
+    defer msa.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), msa.nseq());
+    try std.testing.expectEqualStrings("seq1", msa.names[0]);
+}
+
+test "Reader.readMsa: pfam treated as stockholm" {
+    const allocator = std.testing.allocator;
+    const data = "# STOCKHOLM 1.0\n\nseq1  ACGT\nseq2  TTTT\n//\n";
+
+    var reader = try Reader.fromMemory(allocator, &alphabet_mod.dna, data, .pfam);
+    defer reader.deinit();
+
+    var msa = (try reader.readMsa()) orelse return error.ExpectedMsa;
+    defer msa.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), msa.nseq());
+}
+
+test "Reader.readMsa: returns error.UnsupportedFormat for fasta" {
+    const allocator = std.testing.allocator;
+    const data = ">seq1\nACGT\n>seq2\nGGGG\n";
+
+    var reader = try Reader.fromMemory(allocator, &alphabet_mod.dna, data, .fasta);
+    defer reader.deinit();
+
+    try std.testing.expectError(error.UnsupportedFormat, reader.readMsa());
+}
+
+test "Reader.readMsa: returns error.UnsupportedFormat for genbank" {
+    const allocator = std.testing.allocator;
+    const data =
+        \\LOCUS       SEQ1
+        \\ORIGIN
+        \\        1 acgt
+        \\//
+        \\
+    ;
+
+    var reader = try Reader.fromMemory(allocator, &alphabet_mod.dna, data, .genbank);
+    defer reader.deinit();
+
+    try std.testing.expectError(error.UnsupportedFormat, reader.readMsa());
 }
 
 /// Test helper: compress data with gzip using external gzip command.
